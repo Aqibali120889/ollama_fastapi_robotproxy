@@ -1,12 +1,14 @@
 import json
 import logging
+import uuid
 from typing import Dict
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from app.config import get_settings
-from app.ollama_proxy import OllamaProxyError, check_ollama_reachability, detect_cuda, route_chat_request
+from app.conversation_graph import build_conversation_graph
+from app.ollama_proxy import OllamaProxyError, check_ollama_reachability, detect_cuda
 from app.rag_pipeline import rag_answer, rag_answer_stream
 from app.schemas import ChatRequest, ChatResponse, HealthResponse, RagRequest, RagResponse
 
@@ -15,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 settings = get_settings()
 app = FastAPI(title=settings.service_name)
+conversation_graph = build_conversation_graph(settings)
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -46,10 +49,29 @@ async def health() -> Dict[str, object]:
 @app.post("/chat", response_model=ChatResponse)
 @app.post("/agent", response_model=ChatResponse)
 async def chat(payload: ChatRequest) -> ChatResponse:
+    session_id = payload.session_id or str(uuid.uuid4())
     try:
-        output, model, source_meta = await route_chat_request(settings, payload)
-        source = source_meta[0]["source"] if source_meta else "unknown"
-        return ChatResponse(model=model, output=output, source=source)
+        question = payload.prompt or (payload.messages[-1].content if payload.messages else "")
+        state = await conversation_graph.ainvoke(
+            {
+                "session_id": session_id,
+                "user_question": question,
+                "incoming_messages": payload.messages or [],
+                "mode": payload.mode,
+                "model": payload.model,
+                "top_k": settings.rag_top_k,
+                "metadata_filters": payload.metadata_filters,
+            }
+        )
+        return ChatResponse(
+            model=state.get("response_model", settings.remote_primary_model),
+            output=state.get("response_text", ""),
+            source=state.get("response_source", "unknown"),
+            session_id=state.get("session_id", session_id),
+            used_rag=state.get("used_rag", False),
+            timings=state.get("timings", {}),
+            sources=state.get("sources", []),
+        )
     except OllamaProxyError as exc:
         logger.exception("Chat routing failed")
         raise HTTPException(
@@ -60,23 +82,43 @@ async def chat(payload: ChatRequest) -> ChatResponse:
                 "attempts": exc.attempts,
             },
         ) from exc
+    except Exception as exc:
+        logger.exception("Conversation orchestration failed")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Conversation orchestration failed.",
+                "error": str(exc),
+                "hint": "Check Ollama endpoints and knowledge-base indexing status.",
+            },
+        ) from exc
 
 
 @app.post("/rag/ask", response_model=RagResponse)
 async def rag_ask(payload: RagRequest) -> RagResponse:
     try:
-        result = await rag_answer(settings, payload.question, top_k=payload.top_k)
+        result = await rag_answer(
+            settings,
+            payload.question,
+            top_k=payload.top_k,
+            session_id=payload.session_id,
+            metadata_filters=payload.metadata_filters,
+        )
         return RagResponse(**result)
     except Exception as exc:
         logger.exception("RAG query failed")
-        raise HTTPException(status_code=503, detail={"message": "RAG pipeline failed.", "error": str(exc)}) from exc
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "RAG pipeline failed.",
+                "error": str(exc),
+                "hint": "Ensure Ollama embedding/chat endpoints are healthy and run scripts/ingest_kb.py.",
+            },
+        ) from exc
 
 
 @app.websocket("/ws/rag")
 async def ws_rag(websocket: WebSocket):
-    """Streaming RAG endpoint. Client sends a plain-text question per message; server streams
-    back JSON events: {"type": "meta", ...} once routing is decided, {"type": "token", "text": ...}
-    per generated token, then {"type": "done", "answer": ..., "timings": ...} at the end."""
     await websocket.accept()
     try:
         while True:

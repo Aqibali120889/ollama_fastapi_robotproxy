@@ -4,3 +4,5 @@ __pycache__/
 chroma_store/
 rag_evaluation_report.md
 logs/
+artifacts/**/*
+!artifacts/**/.gitkeep
