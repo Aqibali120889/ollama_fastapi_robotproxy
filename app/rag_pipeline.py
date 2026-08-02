@@ -282,27 +282,48 @@ async def rag_answer_stream(
         else:
             prompt = DIRECT_CHAT_TEMPLATE.format(question=question)
 
-        async with client.stream(
-            "POST",
-            f"{settings.ollama_local_base_url.rstrip('/')}/api/generate",
-            json={
-                "model": settings.remote_primary_model,
-                "prompt": prompt,
-                "stream": True,
-                "keep_alive": _keep_alive_value(settings.ollama_keep_alive),
-            },
-        ) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line:
-                    continue
-                chunk = json.loads(line)
-                token = chunk.get("response", "")
-                if token:
-                    answer_parts.append(token)
-                    yield {"type": "token", "text": token}
-                if chunk.get("done"):
-                    break
+        try:
+            async with client.stream(
+                "POST",
+                f"{settings.ollama_local_base_url.rstrip('/')}/api/generate",
+                json={
+                    "model": settings.remote_primary_model,
+                    "prompt": prompt,
+                    "stream": True,
+                    "keep_alive": _keep_alive_value(settings.ollama_keep_alive),
+                },
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    chunk = json.loads(line)
+                    token = chunk.get("response", "")
+                    if token:
+                        answer_parts.append(token)
+                        yield {"type": "token", "text": token}
+                    if chunk.get("done"):
+                        break
+        except Exception:
+            fallback = await rag_answer(
+                settings=settings,
+                question=question,
+                top_k=top_k,
+                session_id=session_id,
+                metadata_filters=metadata_filters,
+            )
+            answer = fallback["answer"]
+            timings.update(fallback.get("timings", {}))
+            yield {"type": "token", "text": answer}
+            yield {
+                "type": "done",
+                "session_id": session_id,
+                "answer": answer,
+                "used_rag": fallback["used_rag"],
+                "sources": fallback["sources"],
+                "timings": timings,
+            }
+            return
 
         timings["generation_s"] = round(time.perf_counter() - t0, 3)
 
