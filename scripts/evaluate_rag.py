@@ -1,63 +1,119 @@
+import argparse
 import asyncio
+import csv
+import json
+import re
+import statistics
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable, List, Set
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import get_settings
 from app.rag_pipeline import rag_answer
 
-# Mix of KB-answerable questions, one deliberately unanswerable question (tests refusal
-# instead of hallucination), and small-talk questions (tests the router sending queries
-# to the direct-chat path instead of RAG when nothing in the KB is relevant).
-TEST_QUESTIONS = [
-    "What does NovaTech Robotics do?",
-    "How much does the NovaBot Assembly Arm cost?",
-    "What is your return policy if I need to cancel an order?",
-    "Does NovaFleet AMR store camera footage?",
-    "What is the CEO's favorite food?",  # not in the KB — should be refused, not hallucinated
-    "Can you customize the assembly arm for my product line?",
-    "Hi there! How's your day going?",  # small talk — router should skip RAG
-    "Nice robot design, by the way!",  # small talk — router should skip RAG
-]
+
+def _tokens(text: str) -> Set[str]:
+    return set(re.findall(r"[a-zA-Z0-9]+", text.lower()))
 
 
-async def main():
+def jaccard(a: Iterable[str], b: Iterable[str]) -> float:
+    a_set = set(a)
+    b_set = set(b)
+    if not a_set and not b_set:
+        return 1.0
+    if not a_set or not b_set:
+        return 0.0
+    return len(a_set & b_set) / len(a_set | b_set)
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser(description="Run lightweight RAG evaluation metrics")
+    parser.add_argument("--dataset", default="evaluation/rag_eval_dataset.json")
+    parser.add_argument("--out-dir", default="artifacts/evaluation")
+    parser.add_argument("--top-k", type=int, default=None)
+    args = parser.parse_args()
+
+    root = Path(__file__).resolve().parent.parent
+    dataset_path = root / args.dataset
+    out_dir = root / args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
     settings = get_settings()
-    lines = [f"# RAG Evaluation Report\n\nGenerated: {datetime.now(timezone.utc).isoformat()}\n"]
 
-    for i, question in enumerate(TEST_QUESTIONS, start=1):
-        print(f"[{i}/{len(TEST_QUESTIONS)}] {question}")
-        result = await rag_answer(settings, question)
+    rows: List[dict] = []
+    for item in dataset:
+        result = await rag_answer(settings, item["question"], top_k=args.top_k)
 
-        route = "RAG (grounded in KB)" if result["used_rag"] else "Direct chat (router skipped RAG)"
+        expected_sources = set(item.get("expected_sources", []))
+        retrieved_sources = set(result.get("sources", []))
+        source_hits = len(expected_sources & retrieved_sources)
 
-        lines.append(f"## Q{i}: {question}\n")
-        lines.append(f"**Router decision:** {route}\n")
-        if settings.enable_query_rewrite:
-            lines.append(f"**Rewritten search query:** {result['search_query']}\n")
-        lines.append(f"**Answer:** {result['answer']}\n")
-        lines.append(f"**Timings (s):** {result['timings']}\n")
+        precision = source_hits / len(retrieved_sources) if retrieved_sources else 0.0
+        recall = source_hits / len(expected_sources) if expected_sources else 0.0
 
-        if result["used_rag"]:
-            lines.append(f"**Sources retrieved:** {', '.join(result['sources']) or 'none'}\n")
-            lines.append("**Retrieved chunks (with distance, lower = more relevant):**\n")
-            for src, dist, chunk in zip(result["sources"], result["distances"], result["retrieved_chunks"]):
-                preview = chunk[:180] + ("..." if len(chunk) > 180 else "")
-                lines.append(f"- `{src}` (distance={dist:.4f}): {preview}\n")
-        else:
-            best = min(result["distances"]) if result["distances"] else None
-            lines.append(f"**Best retrieval distance was {best:.4f} — above threshold "
-                          f"({settings.rag_distance_threshold}), so RAG was skipped.**\n" if best is not None
-                          else "**No chunks in the collection at all.**\n")
+        relevance = jaccard(_tokens(result["answer"]), set(k.lower() for k in item.get("reference_keywords", [])))
+        context_text = " ".join(result.get("retrieved_chunks", []))
+        answer_tokens = _tokens(result["answer"])
+        context_tokens = _tokens(context_text)
+        faithfulness = len(answer_tokens & context_tokens) / len(answer_tokens) if answer_tokens else 0.0
 
-        lines.append("\n---\n")
+        rows.append(
+            {
+                "question": item["question"],
+                "session_id": result.get("session_id", ""),
+                "used_rag": result.get("used_rag", False),
+                "answer_relevance": round(relevance, 4),
+                "context_precision": round(precision, 4),
+                "context_recall": round(recall, 4),
+                "faithfulness_proxy": round(faithfulness, 4),
+                "latency_s": round(float(result.get("timings", {}).get("total_s", 0.0)), 4),
+                "sources": ";".join(result.get("sources", [])),
+            }
+        )
 
-    report_path = Path(__file__).resolve().parent.parent / "rag_evaluation_report.md"
-    report_path.write_text("\n".join(lines), encoding="utf-8")
-    print(f"\nReport written to: {report_path}")
-    print(f"Structured event log at: {settings.rag_log_path}")
+    metrics = {
+        "answer_relevance_avg": round(statistics.mean(r["answer_relevance"] for r in rows), 4),
+        "context_precision_avg": round(statistics.mean(r["context_precision"] for r in rows), 4),
+        "context_recall_avg": round(statistics.mean(r["context_recall"] for r in rows), 4),
+        "faithfulness_proxy_avg": round(statistics.mean(r["faithfulness_proxy"] for r in rows), 4),
+        "latency_s_avg": round(statistics.mean(r["latency_s"] for r in rows), 4),
+    }
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    json_path = out_dir / f"rag_eval_{ts}.json"
+    csv_path = out_dir / f"rag_eval_{ts}.csv"
+
+    json_path.write_text(
+        json.dumps(
+            {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "dataset": args.dataset,
+                "assumptions": {
+                    "answer_relevance": "Jaccard overlap between answer tokens and reference keywords",
+                    "context_precision_recall": "Source overlap against expected_sources",
+                    "faithfulness_proxy": "Fraction of answer tokens present in retrieved context",
+                },
+                "aggregate_metrics": metrics,
+                "rows": rows,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print("Aggregate metrics:")
+    for k, v in metrics.items():
+        print(f"- {k}: {v}")
+    print(f"\nSaved:\n- {json_path}\n- {csv_path}")
 
 
 if __name__ == "__main__":

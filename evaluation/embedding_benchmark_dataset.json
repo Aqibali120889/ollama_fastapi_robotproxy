@@ -1,0 +1,12 @@
+{
+  "documents": [
+    {"id": "doc_pricing", "text": "NovaBot Assembly Arm starts at $48,000 and includes safety calibration support.", "source": "pricing.md"},
+    {"id": "doc_privacy", "text": "NovaFleet AMR keeps event logs for 30 days and does not store continuous camera footage by default.", "source": "privacy.md"},
+    {"id": "doc_support", "text": "Support is available 24/7 with remote diagnostics and an on-site response SLA for enterprise plans.", "source": "support.md"}
+  ],
+  "queries": [
+    {"question": "How much does the assembly arm cost?", "expected_source": "pricing.md"},
+    {"question": "Do you keep camera recordings forever?", "expected_source": "privacy.md"},
+    {"question": "What support options are available?", "expected_source": "support.md"}
+  ]
+}

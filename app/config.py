@@ -31,10 +31,18 @@ class Settings(BaseSettings):
     rag_chunk_size: int = Field(default=800, ge=100)
     rag_chunk_overlap: int = Field(default=120, ge=0)
     rag_top_k: int = Field(default=4, ge=1, le=10)
+    rag_candidate_pool_multiplier: int = Field(default=4, ge=1, le=10)
 
     enable_query_rewrite: bool = Field(default=True)
     rag_distance_threshold: float = Field(default=0.46, ge=0.0, le=2.0)
+    rag_dense_weight: float = Field(default=0.7, ge=0.0, le=1.0)
+    rag_keyword_weight: float = Field(default=0.3, ge=0.0, le=1.0)
+    rag_min_fusion_score: float = Field(default=0.05, ge=0.0, le=1.0)
+    rag_context_max_chars: int = Field(default=2800, ge=500, le=12000)
+    rag_context_max_chunks: int = Field(default=4, ge=1, le=10)
+    rag_dedupe_similarity_threshold: float = Field(default=0.92, ge=0.5, le=1.0)
     rag_log_path: str = Field(default="./logs/rag_events.jsonl")
+    memory_max_turns: int = Field(default=8, ge=1, le=50)
 
     # Keeps a model resident in (V)RAM between requests instead of reloading it every call.
     # "30m" = stay loaded for 30 minutes of inactivity; "-1" = stay loaded indefinitely.

@@ -33,7 +33,15 @@ async def main():
                 ids=[chunk.id],
                 embeddings=[embedding],
                 documents=[chunk.text],
-                metadatas=[{"source": chunk.source, "chunk_index": chunk.chunk_index}],
+                metadatas=[
+                    {
+                        "source": chunk.source,
+                        "source_path": chunk.source_path,
+                        "extension": chunk.extension,
+                        "file_type": chunk.file_type,
+                        "chunk_index": chunk.chunk_index,
+                    }
+                ],
             )
             print(f"  [{i}/{len(chunks)}] embedded and stored: {chunk.id}")
 

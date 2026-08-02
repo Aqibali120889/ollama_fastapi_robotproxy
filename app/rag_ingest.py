@@ -12,6 +12,9 @@ class Chunk:
     id: str
     text: str
     source: str
+    source_path: str
+    extension: str
+    file_type: str
     chunk_index: int
 
 
@@ -22,7 +25,7 @@ def _read_file(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def load_documents(kb_dir: str) -> List[tuple[str, str]]:
+def load_documents(kb_dir: str) -> List[tuple[str, str, str, str]]:
     base = Path(kb_dir)
     if not base.exists():
         raise FileNotFoundError(f"Knowledge base directory not found: {kb_dir}")
@@ -32,7 +35,9 @@ def load_documents(kb_dir: str) -> List[tuple[str, str]]:
         if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
             text = _read_file(path).strip()
             if text:
-                documents.append((path.name, text))
+                rel_path = str(path.relative_to(base))
+                ext = path.suffix.lower().lstrip(".")
+                documents.append((path.name, rel_path, ext, text))
     return documents
 
 
@@ -55,7 +60,17 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
 
 def build_chunks(kb_dir: str, chunk_size: int, overlap: int) -> List[Chunk]:
     chunks: List[Chunk] = []
-    for source, text in load_documents(kb_dir):
+    for source, source_path, extension, text in load_documents(kb_dir):
         for i, piece in enumerate(chunk_text(text, chunk_size, overlap)):
-            chunks.append(Chunk(id=f"{source}::{i}", text=piece, source=source, chunk_index=i))
+            chunks.append(
+                Chunk(
+                    id=f"{source_path}::{i}",
+                    text=piece,
+                    source=source,
+                    source_path=source_path,
+                    extension=extension,
+                    file_type=extension,
+                    chunk_index=i,
+                )
+            )
     return chunks

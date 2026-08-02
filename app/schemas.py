@@ -1,4 +1,4 @@
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -13,6 +13,8 @@ class ChatRequest(BaseModel):
     messages: Optional[List[ChatMessage]] = None
     mode: Literal["chat", "code", "vision"] = "chat"
     model: Optional[str] = None
+    session_id: Optional[str] = Field(default=None, min_length=1)
+    metadata_filters: Optional[Dict[str, str]] = None
 
     @model_validator(mode="after")
     def validate_input(self) -> "ChatRequest":
@@ -25,6 +27,10 @@ class ChatResponse(BaseModel):
     model: str
     output: str
     source: str
+    session_id: str
+    used_rag: bool = False
+    timings: Dict[str, float] = Field(default_factory=dict)
+    sources: List[str] = Field(default_factory=list)
 
 
 class HealthCheckResult(BaseModel):
@@ -45,11 +51,15 @@ class HealthResponse(BaseModel):
 class RagRequest(BaseModel):
     question: str = Field(min_length=1)
     top_k: Optional[int] = Field(default=None, ge=1, le=10)
+    session_id: Optional[str] = Field(default=None, min_length=1)
+    metadata_filters: Optional[Dict[str, str]] = None
 
 
 class RagResponse(BaseModel):
     answer: str
+    session_id: str
     sources: List[str]
+    retrieved_metadata: List[Dict[str, str]]
     retrieved_chunks: List[str]
     distances: List[float]
     used_rag: bool

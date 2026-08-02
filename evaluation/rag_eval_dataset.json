@@ -1,0 +1,17 @@
+[
+  {
+    "question": "What does NovaTech Robotics do?",
+    "expected_sources": ["company_overview.txt"],
+    "reference_keywords": ["robotics", "automation", "solutions"]
+  },
+  {
+    "question": "How much does the NovaBot Assembly Arm cost?",
+    "expected_sources": ["products_and_pricing.txt"],
+    "reference_keywords": ["NovaBot", "cost", "pricing"]
+  },
+  {
+    "question": "Does NovaFleet AMR store camera footage?",
+    "expected_sources": ["data_and_security.txt"],
+    "reference_keywords": ["camera", "storage", "policy"]
+  }
+]
