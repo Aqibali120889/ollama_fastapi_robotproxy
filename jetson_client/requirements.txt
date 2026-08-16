@@ -1,0 +1,7 @@
+# Thin edge client only -- audio capture/playback + a websocket, nothing else.
+# No torch, no Whisper, no TTS, no DeepFilterNet: those all run server-side.
+pyaudio>=0.2.14
+sounddevice>=0.4.6
+websockets>=12.0
+numpy>=1.26.0
+python-dotenv>=1.0.1

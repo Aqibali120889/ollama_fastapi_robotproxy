@@ -19,6 +19,22 @@ def _tokens(text: str) -> Set[str]:
     return set(re.findall(r"[a-zA-Z0-9]+", text.lower()))
 
 
+def keyword_coverage(answer: str, reference_keywords: Iterable[str]) -> float:
+    """Fraction of reference keywords that appear (as a substring, case-insensitive)
+    in the answer. Used as the pass/fail accuracy signal, since raw Jaccard overlap
+    is a poor fit for a percentage-style accuracy gate on short answers."""
+    keywords = list(reference_keywords)
+    if not keywords:
+        return 1.0
+    answer_lower = answer.lower()
+    hits = sum(1 for kw in keywords if kw.lower() in answer_lower)
+    return hits / len(keywords)
+
+
+def question_passes(used_rag: bool, coverage: float, keyword_pass_threshold: float) -> bool:
+    return bool(used_rag) and coverage >= keyword_pass_threshold
+
+
 def jaccard(a: Iterable[str], b: Iterable[str]) -> float:
     a_set = set(a)
     b_set = set(b)
@@ -34,6 +50,18 @@ async def main() -> None:
     parser.add_argument("--dataset", default="evaluation/rag_eval_dataset.json")
     parser.add_argument("--out-dir", default="artifacts/evaluation")
     parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument(
+        "--keyword-pass-threshold",
+        type=float,
+        default=0.5,
+        help="Fraction of a question's reference_keywords that must appear in the answer to count as a pass.",
+    )
+    parser.add_argument(
+        "--min-accuracy",
+        type=float,
+        default=0.8,
+        help="Minimum fraction of questions that must pass for the run to succeed (exit code 1 otherwise).",
+    )
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent.parent
@@ -60,6 +88,8 @@ async def main() -> None:
         answer_tokens = _tokens(result["answer"])
         context_tokens = _tokens(context_text)
         faithfulness = len(answer_tokens & context_tokens) / len(answer_tokens) if answer_tokens else 0.0
+        coverage = keyword_coverage(result["answer"], item.get("reference_keywords", []))
+        passed = question_passes(result.get("used_rag", False), coverage, args.keyword_pass_threshold)
 
         rows.append(
             {
@@ -70,16 +100,20 @@ async def main() -> None:
                 "context_precision": round(precision, 4),
                 "context_recall": round(recall, 4),
                 "faithfulness_proxy": round(faithfulness, 4),
+                "keyword_coverage": round(coverage, 4),
+                "passed": passed,
                 "latency_s": round(float(result.get("timings", {}).get("total_s", 0.0)), 4),
                 "sources": ";".join(result.get("sources", [])),
             }
         )
 
+    accuracy = sum(1 for r in rows if r["passed"]) / len(rows)
     metrics = {
         "answer_relevance_avg": round(statistics.mean(r["answer_relevance"] for r in rows), 4),
         "context_precision_avg": round(statistics.mean(r["context_precision"] for r in rows), 4),
         "context_recall_avg": round(statistics.mean(r["context_recall"] for r in rows), 4),
         "faithfulness_proxy_avg": round(statistics.mean(r["faithfulness_proxy"] for r in rows), 4),
+        "accuracy": round(accuracy, 4),
         "latency_s_avg": round(statistics.mean(r["latency_s"] for r in rows), 4),
     }
 
@@ -96,6 +130,10 @@ async def main() -> None:
                     "answer_relevance": "Jaccard overlap between answer tokens and reference keywords",
                     "context_precision_recall": "Source overlap against expected_sources",
                     "faithfulness_proxy": "Fraction of answer tokens present in retrieved context",
+                    "accuracy": (
+                        f"Fraction of questions that used RAG and covered >= {args.keyword_pass_threshold * 100:.0f}% "
+                        "of reference_keywords in the answer"
+                    ),
                 },
                 "aggregate_metrics": metrics,
                 "rows": rows,
@@ -114,6 +152,12 @@ async def main() -> None:
     for k, v in metrics.items():
         print(f"- {k}: {v}")
     print(f"\nSaved:\n- {json_path}\n- {csv_path}")
+
+    if accuracy >= args.min_accuracy:
+        print(f"\nPASS: accuracy {accuracy:.2%} >= required {args.min_accuracy:.2%}")
+    else:
+        print(f"\nFAIL: accuracy {accuracy:.2%} < required {args.min_accuracy:.2%}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
+import asyncio
 import json
 import logging
+import time
 import uuid
 from typing import Dict
 
@@ -11,6 +13,9 @@ from app.conversation_graph import build_conversation_graph
 from app.ollama_proxy import OllamaProxyError, check_ollama_reachability, detect_cuda
 from app.rag_pipeline import rag_answer, rag_answer_stream
 from app.schemas import ChatRequest, ChatResponse, HealthResponse, RagRequest, RagResponse
+from app.voice_denoise import denoise
+from app.voice_stt import transcribe
+from app.voice_tts import synthesize
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -32,7 +37,6 @@ async def health() -> Dict[str, object]:
         "service": settings.service_name,
         "models": {
             "remote_primary": settings.remote_primary_model,
-            "remote_secondary": settings.remote_secondary_model,
             "local_fallback": settings.local_fallback_model,
             "code_model": settings.code_model,
             "embedding_model": settings.embedding_model,
@@ -130,6 +134,101 @@ async def ws_rag(websocket: WebSocket):
                     await websocket.send_text(json.dumps(event))
             except Exception as exc:
                 logger.exception("Streaming RAG query failed")
+                await websocket.send_text(json.dumps({"type": "error", "message": str(exc)}))
+    except WebSocketDisconnect:
+        pass
+
+
+@app.websocket("/ws/voice")
+async def ws_voice(websocket: WebSocket):
+    """Audio-in -> denoise -> Whisper -> RAG/LLM -> XTTS-v2 -> audio-out.
+
+    One session_id is minted for the lifetime of the connection and reused for
+    every utterance, so conversation_graph's SessionMemoryStore gives multi-turn
+    continuity for free -- unlike /ws/rag, which mints a fresh session per message.
+    """
+    await websocket.accept()
+    session_id = str(uuid.uuid4())
+    await websocket.send_text(json.dumps({"type": "session", "session_id": session_id}))
+
+    try:
+        while True:
+            audio_bytes = await websocket.receive_bytes()
+            if not audio_bytes:
+                continue
+
+            total_start = time.perf_counter()
+            timings: Dict[str, float] = {}
+
+            try:
+                t0 = time.perf_counter()
+                if settings.enable_denoise:
+                    audio_bytes = await asyncio.to_thread(denoise, audio_bytes, settings.voice_sample_rate)
+                timings["denoise_s"] = round(time.perf_counter() - t0, 3)
+
+                t0 = time.perf_counter()
+                question = await asyncio.to_thread(
+                    transcribe,
+                    audio_bytes,
+                    settings.stt_model_size,
+                    settings.stt_device,
+                    settings.stt_compute_type,
+                    settings.stt_language,
+                )
+                timings["stt_s"] = round(time.perf_counter() - t0, 3)
+
+                if not question.strip():
+                    await websocket.send_text(json.dumps({"type": "error", "message": "No speech detected."}))
+                    continue
+
+                await websocket.send_text(json.dumps({"type": "transcript", "text": question}))
+
+                t0 = time.perf_counter()
+                state = await conversation_graph.ainvoke(
+                    {
+                        "session_id": session_id,
+                        "user_question": question,
+                        "incoming_messages": [],
+                        "mode": "chat",
+                        "model": None,
+                        "top_k": settings.rag_top_k,
+                        "metadata_filters": None,
+                    }
+                )
+                timings["rag_generation_s"] = round(time.perf_counter() - t0, 3)
+
+                answer_text = state.get("response_text", "")
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "meta",
+                            "used_rag": state.get("used_rag", False),
+                            "sources": state.get("sources", []),
+                            "answer": answer_text,
+                        }
+                    )
+                )
+
+                t0 = time.perf_counter()
+                audio_out, sample_rate = await asyncio.to_thread(
+                    synthesize,
+                    answer_text,
+                    settings.tts_model_name,
+                    settings.tts_device,
+                    settings.tts_speaker,
+                    settings.tts_language,
+                )
+                timings["tts_s"] = round(time.perf_counter() - t0, 3)
+                timings["total_s"] = round(time.perf_counter() - total_start, 3)
+
+                await websocket.send_text(
+                    json.dumps({"type": "audio_meta", "sample_rate": sample_rate, "timings": timings})
+                )
+                if audio_out:
+                    await websocket.send_bytes(audio_out)
+                await websocket.send_text(json.dumps({"type": "done", "session_id": session_id, "timings": timings}))
+            except Exception as exc:
+                logger.exception("Voice pipeline stage failed")
                 await websocket.send_text(json.dumps({"type": "error", "message": str(exc)}))
     except WebSocketDisconnect:
         pass

@@ -15,6 +15,7 @@ class ChatRequest(BaseModel):
     model: Optional[str] = None
     session_id: Optional[str] = Field(default=None, min_length=1)
     metadata_filters: Optional[Dict[str, str]] = None
+    options: Optional[Dict[str, object]] = None
 
     @model_validator(mode="after")
     def validate_input(self) -> "ChatRequest":

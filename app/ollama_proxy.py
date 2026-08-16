@@ -31,14 +31,21 @@ def _models_for_mode(settings: Settings, payload: ChatRequest) -> List[str]:
 
     remote_models: List[str]
     if payload.mode == "code":
-        remote_models = [settings.code_model, settings.remote_primary_model, settings.remote_secondary_model]
+        remote_models = [settings.code_model, settings.remote_primary_model]
     elif payload.mode == "vision":
-        remote_models = [settings.vision_model, settings.remote_primary_model, settings.remote_secondary_model]
+        remote_models = [settings.vision_model, settings.remote_primary_model]
     else:
-        remote_models = [settings.remote_primary_model, settings.remote_secondary_model]
+        remote_models = [settings.remote_primary_model]
 
     seen = set()
     return [model for model in remote_models if model and not (model in seen or seen.add(model))]
+
+
+def _keep_alive_value(raw: str) -> object:
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
 
 
 async def _call_ollama_chat(
@@ -47,9 +54,15 @@ async def _call_ollama_chat(
     model: str,
     messages: List[Dict[str, str]],
     retries: int,
+    keep_alive: Optional[str] = None,
+    options: Optional[Dict[str, object]] = None,
 ) -> Tuple[str, str]:
     endpoint = f"{base_url.rstrip('/')}/api/chat"
-    payload = {"model": model, "messages": messages, "stream": False}
+    payload: Dict[str, object] = {"model": model, "messages": messages, "stream": False}
+    if keep_alive is not None:
+        payload["keep_alive"] = _keep_alive_value(keep_alive)
+    if options:
+        payload["options"] = options
     last_error: Optional[str] = None
 
     for attempt in range(retries + 1):
@@ -94,6 +107,8 @@ async def route_chat_request(settings: Settings, payload: ChatRequest) -> Tuple[
                         model=model,
                         messages=messages,
                         retries=settings.max_retries,
+                        keep_alive=settings.ollama_keep_alive,
+                        options=payload.options,
                     )
                     return output, used_model, [{"source": "remote", "url": remote_url}]
                 except OllamaProxyError as exc:
@@ -107,6 +122,8 @@ async def route_chat_request(settings: Settings, payload: ChatRequest) -> Tuple[
                 model=local_model,
                 messages=messages,
                 retries=settings.max_retries,
+                keep_alive=settings.ollama_keep_alive,
+                options=payload.options,
             )
             return output, used_model, [{"source": "local", "url": settings.ollama_local_base_url}]
         except OllamaProxyError as exc:

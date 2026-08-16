@@ -6,3 +6,4 @@ rag_evaluation_report.md
 logs/
 artifacts/**/*
 !artifacts/**/.gitkeep
+.claude/**

@@ -3,6 +3,7 @@ import logging
 import time
 import uuid
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import AsyncGenerator, Dict, List, Optional, Union
 
 import httpx
@@ -10,9 +11,11 @@ import httpx
 from app.config import Settings
 from app.hybrid_retriever import hybrid_retrieve
 from app.ollama_proxy import route_chat_request
+from app.rag_cache import get_context_cache
 from app.rag_logging import log_rag_event
 from app.rag_store import embed_text, get_collection
 from app.schemas import ChatMessage, ChatRequest
+from app.vision import describe_image
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +29,8 @@ def _keep_alive_value(raw: str) -> Union[int, str]:
 
 RAG_PROMPT_TEMPLATE = """You are an AI assistant representing a company at a business expo booth. \
 Answer the visitor's question using ONLY the context below. If the answer is not contained in the \
-context, say you don't have that information and offer to connect them with a team member. Keep the \
-answer concise and professional (2-4 sentences).
+context, say you don't have that information and offer to connect them with a team member. Answer \
+directly with no preamble, in at most 4 concise, professional sentences.
 
 Context:
 {context}
@@ -36,9 +39,9 @@ Visitor question: {question}
 
 Answer:"""
 
-REWRITE_PROMPT_TEMPLATE = """Rewrite the visitor's question as a short, clear search query using the \
-kind of formal terminology likely to appear in company documentation. Return ONLY the rewritten \
-query, with no extra commentary or punctuation.
+REWRITE_PROMPT_TEMPLATE = """Rewrite the visitor's question as a short search query (3-8 words) using \
+the kind of formal terminology likely to appear in company documentation. Return ONLY the rewritten \
+query -- no punctuation, no quotes, no explanation.
 
 Visitor question: {question}
 
@@ -51,6 +54,58 @@ naturally and conversationally without inventing any company facts. Keep it brie
 Visitor: {question}
 
 Response:"""
+
+# Conversational phrasing that suggests the question would benefit from being
+# rewritten into a terser, documentation-style search query before embedding.
+_REWRITE_FILLER_PATTERNS = (
+    "i was wondering",
+    "can you tell me",
+    "could you tell me",
+    "do you know",
+    "what about",
+    "i want to know",
+    "i'd like to know",
+    "so, ",
+    "so what",
+    "hey,",
+    "hey ",
+    "um,",
+    "um ",
+)
+
+
+def _needs_rewrite(question: str, settings: Settings) -> bool:
+    """Fast, LLM-free heuristic deciding whether a question should be rewritten
+    into a short search query before embedding. Short, already query-like
+    questions skip the rewrite LLM call entirely."""
+    if not settings.enable_query_rewrite:
+        return False
+    stripped = question.strip().lower()
+    if not stripped:
+        return False
+    if len(stripped.split()) > settings.rag_rewrite_word_threshold:
+        return True
+    return any(pattern in stripped for pattern in _REWRITE_FILLER_PATTERNS)
+
+
+def _normalize_question(question: str) -> str:
+    return " ".join(question.strip().lower().split())
+
+
+def _context_cache_key(
+    settings: Settings,
+    question: str,
+    top_k: int,
+    metadata_filters: Optional[Dict[str, str]],
+):
+    filters_key = tuple(sorted(metadata_filters.items())) if metadata_filters else None
+    return (
+        _normalize_question(question),
+        top_k,
+        filters_key,
+        settings.rag_dense_weight,
+        settings.rag_keyword_weight,
+    )
 
 
 def _dedupe_and_cap_context(
@@ -67,6 +122,9 @@ def _dedupe_and_cap_context(
     char_budget = 0
 
     for doc, metadata, distance, fusion_score in zip(documents, metadatas, distances, fusion_scores):
+        if len(selected_docs) >= settings.rag_context_max_chunks:
+            break
+
         if any(
             SequenceMatcher(None, doc, existing).ratio() >= settings.rag_dedupe_similarity_threshold
             for existing in selected_docs
@@ -74,8 +132,9 @@ def _dedupe_and_cap_context(
             continue
 
         next_budget = char_budget + len(doc)
-        if next_budget > settings.rag_context_max_chars or len(selected_docs) >= settings.rag_context_max_chunks:
-            break
+        if next_budget > settings.rag_context_max_chars:
+            # Skip (don't stop) so a later, smaller chunk still gets a chance to fit.
+            continue
 
         selected_docs.append(doc)
         selected_meta.append(metadata)
@@ -99,11 +158,61 @@ async def _rewrite_query(client: httpx.AsyncClient, settings: Settings, question
             "prompt": REWRITE_PROMPT_TEMPLATE.format(question=question),
             "stream": False,
             "keep_alive": _keep_alive_value(settings.ollama_keep_alive),
+            "options": {"num_predict": settings.rewrite_max_tokens},
         },
     )
     response.raise_for_status()
     rewritten = response.json().get("response", "").strip()
     return rewritten or question
+
+
+async def _resolve_image_chunks(
+    client: httpx.AsyncClient,
+    settings: Settings,
+    question: str,
+    filtered: Dict[str, List[object]],
+) -> None:
+    """For any retrieved chunk whose metadata marks it as an image, replaces its
+    generic indexed caption with a fresh, question-focused LLaVA description of
+    the original image. Falls back silently to the indexed caption on any
+    failure (missing file, oversized, vision call error)."""
+    kb_dir = Path(settings.knowledge_base_dir)
+
+    for i, metadata in enumerate(filtered["metadatas"]):
+        if metadata.get("type") != "image":
+            continue
+
+        image_source = metadata.get("source")
+        if not image_source:
+            continue
+
+        image_path = kb_dir / str(image_source)
+        try:
+            if not image_path.is_file():
+                continue
+            if image_path.stat().st_size > settings.vision_max_image_bytes:
+                logger.warning("Skipping oversized image for vision captioning: %s", image_path)
+                continue
+
+            image_bytes = image_path.read_bytes()
+            prompt = (
+                "Answer based only on what is visible in this image. "
+                f"Visitor question: {question}\n"
+                "Provide a factual, concise description relevant to the question."
+            )
+            description = await describe_image(
+                client,
+                settings.ollama_local_base_url,
+                settings.vision_model,
+                image_bytes,
+                keep_alive=_keep_alive_value(settings.ollama_keep_alive),
+                prompt=prompt,
+            )
+            if description:
+                filtered["documents"][i] = description
+        except Exception:
+            logger.warning("Vision captioning failed for %s; using indexed description", image_path, exc_info=True)
+            continue
 
 
 async def _prepare_context(
@@ -113,20 +222,43 @@ async def _prepare_context(
     top_k: int,
     metadata_filters: Optional[Dict[str, str]] = None,
 ) -> Dict[str, object]:
+    cache = get_context_cache(settings.rag_cache_max_size, settings.rag_cache_ttl_seconds) if settings.enable_rag_cache else None
+    cache_key = _context_cache_key(settings, question, top_k, metadata_filters)
+
+    if cache is not None:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            result = dict(cached)
+            result["timings"] = {"cache_hit": True}
+            return result
+
     timings: Dict[str, float] = {}
     collection = get_collection(settings.chroma_persist_dir, settings.chroma_collection_name)
 
+    search_query = question
+    if _needs_rewrite(question, settings):
+        t0 = time.perf_counter()
+        search_query = await _rewrite_query(client, settings, question)
+        timings["rewrite_s"] = round(time.perf_counter() - t0, 3)
+
     t0 = time.perf_counter()
     question_embedding = await embed_text(
-        client, settings.ollama_local_base_url, settings.embedding_model, question
+        client,
+        settings.ollama_local_base_url,
+        settings.embedding_model,
+        search_query,
+        keep_alive=_keep_alive_value(settings.ollama_keep_alive),
+        use_cache=settings.enable_rag_cache,
+        cache_max_size=settings.embedding_cache_max_size,
+        cache_ttl_seconds=settings.rag_cache_ttl_seconds,
     )
     timings["embed_s"] = round(time.perf_counter() - t0, 3)
 
     t0 = time.perf_counter()
-    initial = hybrid_retrieve(
+    retrieved = hybrid_retrieve(
         collection=collection,
         query_embedding=question_embedding,
-        query_text=question,
+        query_text=search_query,
         top_k=top_k,
         dense_weight=settings.rag_dense_weight,
         keyword_weight=settings.rag_keyword_weight,
@@ -136,45 +268,22 @@ async def _prepare_context(
     )
     timings["retrieval_s"] = round(time.perf_counter() - t0, 3)
 
-    routing_distances = initial["distances"]
+    routing_distances = retrieved["distances"]
     best_distance = min(routing_distances) if routing_distances else float("inf")
-    used_rag = best_distance <= settings.rag_distance_threshold and bool(initial["documents"])
-
-    search_query = question
-    final = initial
-
-    if used_rag and settings.enable_query_rewrite:
-        t0 = time.perf_counter()
-        search_query = await _rewrite_query(client, settings, question)
-        timings["rewrite_s"] = round(time.perf_counter() - t0, 3)
-
-        t0 = time.perf_counter()
-        rewritten_embedding = await embed_text(
-            client, settings.ollama_local_base_url, settings.embedding_model, search_query
-        )
-        timings["search_embed_s"] = round(time.perf_counter() - t0, 3)
-
-        t0 = time.perf_counter()
-        final = hybrid_retrieve(
-            collection=collection,
-            query_embedding=rewritten_embedding,
-            query_text=search_query,
-            top_k=top_k,
-            dense_weight=settings.rag_dense_weight,
-            keyword_weight=settings.rag_keyword_weight,
-            candidate_pool_size=top_k * settings.rag_candidate_pool_multiplier,
-            min_fusion_score=settings.rag_min_fusion_score,
-            metadata_filters=metadata_filters,
-        )
-        timings["search_retrieval_s"] = round(time.perf_counter() - t0, 3)
+    used_rag = best_distance <= settings.rag_distance_threshold and bool(retrieved["documents"])
 
     filtered = _dedupe_and_cap_context(
         settings=settings,
-        documents=final["documents"],
-        metadatas=final["metadatas"],
-        distances=final["distances"],
-        fusion_scores=final["fusion_scores"],
+        documents=retrieved["documents"],
+        metadatas=retrieved["metadatas"],
+        distances=retrieved["distances"],
+        fusion_scores=retrieved["fusion_scores"],
     )
+
+    if used_rag and filtered["documents"] and any(m.get("type") == "image" for m in filtered["metadatas"]):
+        t0 = time.perf_counter()
+        await _resolve_image_chunks(client, settings, question, filtered)
+        timings["vision_s"] = round(time.perf_counter() - t0, 3)
 
     sources = [meta.get("source", "unknown") for meta in filtered["metadatas"]]
 
@@ -185,7 +294,7 @@ async def _prepare_context(
         used_rag = False
         prompt = DIRECT_CHAT_TEMPLATE.format(question=question)
 
-    return {
+    result = {
         "prompt": prompt,
         "used_rag": used_rag,
         "search_query": search_query,
@@ -195,8 +304,13 @@ async def _prepare_context(
         "fusion_scores": filtered["fusion_scores"],
         "metadatas": filtered["metadatas"],
         "best_distance": best_distance,
-        "timings": timings,
     }
+
+    if cache is not None:
+        cache.set(cache_key, dict(result))
+
+    result["timings"] = timings
+    return result
 
 
 async def rag_answer(
@@ -224,7 +338,12 @@ async def rag_answer(
                 ChatMessage(role="system", content=system_prompt),
                 ChatMessage(role="user", content=ctx["prompt"]),
             ]
-            chat_payload = ChatRequest(messages=messages, mode="chat", session_id=session_id)
+            chat_payload = ChatRequest(
+                messages=messages,
+                mode="chat",
+                session_id=session_id,
+                options={"num_predict": settings.rag_answer_max_tokens},
+            )
             answer, model, source_meta = await route_chat_request(settings, chat_payload)
             timings["generation_s"] = round(time.perf_counter() - t0, 3)
 
@@ -291,6 +410,7 @@ async def rag_answer_stream(
                     "prompt": prompt,
                     "stream": True,
                     "keep_alive": _keep_alive_value(settings.ollama_keep_alive),
+                    "options": {"num_predict": settings.rag_answer_max_tokens},
                 },
             ) as response:
                 response.raise_for_status()

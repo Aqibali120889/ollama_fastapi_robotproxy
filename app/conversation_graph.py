@@ -96,7 +96,13 @@ def build_conversation_graph(settings: Settings):
             *incoming[:-1],
             prompt_message,
         ]
-        payload = ChatRequest(messages=messages, mode="chat", model=state.get("model"), session_id=state["session_id"])
+        payload = ChatRequest(
+            messages=messages,
+            mode="chat",
+            model=state.get("model"),
+            session_id=state["session_id"],
+            options={"num_predict": settings.rag_answer_max_tokens},
+        )
         output, model, source_meta = await route_chat_request(settings, payload)
         return {
             "response_text": output,
@@ -110,11 +116,13 @@ def build_conversation_graph(settings: Settings):
             direct_messages = [*state.get("memory_messages", []), *incoming]
         else:
             direct_messages = [*state.get("memory_messages", []), ChatMessage(role="user", content=state["user_question"])]
+        mode = state.get("mode", "chat")
         payload = ChatRequest(
             messages=direct_messages,
-            mode=state.get("mode", "chat"),
+            mode=mode,
             model=state.get("model"),
             session_id=state["session_id"],
+            options={"num_predict": settings.rag_answer_max_tokens} if mode == "chat" else None,
         )
         output, model, source_meta = await route_chat_request(settings, payload)
         return {

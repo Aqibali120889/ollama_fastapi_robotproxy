@@ -14,7 +14,6 @@ class Settings(BaseSettings):
     ollama_remote_urls: str = Field(default="http://127.0.0.1:11434")
 
     remote_primary_model: str = Field(default="qwen2.5:7b-instruct")
-    remote_secondary_model: str = Field(default="llama3.1:8b-instruct")
     local_fallback_model: str = Field(default="qwen2.5:1.5b-instruct")
 
     code_model: str = Field(default="deepseek-coder:6.7b")
@@ -44,12 +43,48 @@ class Settings(BaseSettings):
     rag_log_path: str = Field(default="./logs/rag_events.jsonl")
     memory_max_turns: int = Field(default=8, ge=1, le=50)
 
+    # Conditional query rewrite: questions longer than this word count (or matching
+    # conversational filler patterns) are rewritten into a short search query before
+    # embedding; short, already query-like questions skip the rewrite LLM call.
+    rag_rewrite_word_threshold: int = Field(default=8, ge=1)
+    rewrite_max_tokens: int = Field(default=32, ge=8)
+    rag_answer_max_tokens: int = Field(default=220, ge=32)
+
+    # In-process retrieval/embedding caching (no external cache store required).
+    enable_rag_cache: bool = Field(default=True)
+    rag_cache_ttl_seconds: int = Field(default=600, ge=0)
+    rag_cache_max_size: int = Field(default=256, ge=1)
+    embedding_cache_max_size: int = Field(default=512, ge=1)
+
+    # Multimodal knowledge-base ingestion (images + PDF-embedded images via LLaVA).
+    kb_image_extensions: str = Field(default=".png,.jpg,.jpeg,.webp,.bmp")
+    vision_max_image_bytes: int = Field(default=15_000_000, ge=1)
+
     # Keeps a model resident in (V)RAM between requests instead of reloading it every call.
     # "30m" = stay loaded for 30 minutes of inactivity; "-1" = stay loaded indefinitely.
     ollama_keep_alive: str = Field(default="30m")
 
+    # Voice pipeline (STT / denoise / TTS) -- all run server-side on this workstation.
+    stt_model_size: str = Field(default="small")
+    stt_device: str = Field(default="cuda")
+    stt_compute_type: str = Field(default="float16")
+    stt_language: str = Field(default="en")
+
+    enable_denoise: bool = Field(default=True)
+
+    tts_model_name: str = Field(default="tts_models/multilingual/multi-dataset/xtts_v2")
+    tts_speaker: str = Field(default="Claribel Dervla")
+    tts_language: str = Field(default="en")
+    tts_device: str = Field(default="cuda")
+
+    voice_sample_rate: int = Field(default=16000, ge=8000)
+    voice_max_audio_seconds: float = Field(default=20.0, ge=1.0)
+
     def remote_urls(self) -> List[str]:
         return [url.strip().rstrip("/") for url in self.ollama_remote_urls.split(",") if url.strip()]
+
+    def image_extensions(self) -> List[str]:
+        return [ext.strip().lower() for ext in self.kb_image_extensions.split(",") if ext.strip()]
 
 
 @lru_cache

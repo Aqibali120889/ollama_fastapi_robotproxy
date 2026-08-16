@@ -1,17 +1,102 @@
 [
   {
-    "question": "What does NovaTech Robotics do?",
-    "expected_sources": ["company_overview.txt"],
-    "reference_keywords": ["robotics", "automation", "solutions"]
+    "question": "What does this project do?",
+    "expected_sources": ["project_overview.md"],
+    "reference_keywords": ["robotic", "telepresence", "expo"]
   },
   {
-    "question": "How much does the NovaBot Assembly Arm cost?",
-    "expected_sources": ["products_and_pricing.txt"],
-    "reference_keywords": ["NovaBot", "cost", "pricing"]
+    "question": "What problem does this project solve for businesses attending expos?",
+    "expected_sources": ["project_overview.md"],
+    "reference_keywords": ["geographical distance", "travel costs", "visa"]
   },
   {
-    "question": "Does NovaFleet AMR store camera footage?",
-    "expected_sources": ["data_and_security.txt"],
-    "reference_keywords": ["camera", "storage", "policy"]
+    "question": "Which university and department is this final year project from?",
+    "expected_sources": ["project_overview.md"],
+    "reference_keywords": ["University of Engineering and Technology", "Computer Engineering", "Taxila"]
+  },
+  {
+    "question": "Who is the supervisor of this project?",
+    "expected_sources": ["project_overview.md"],
+    "reference_keywords": ["Muhammad Haroon Yousaf"]
+  },
+  {
+    "question": "Who is the industry advisor for this project?",
+    "expected_sources": ["project_overview.md"],
+    "reference_keywords": ["Saran Khaliq", "BrainSwarm"]
+  },
+  {
+    "question": "What is Team Alpha responsible for on this project?",
+    "expected_sources": ["project_overview.md"],
+    "reference_keywords": ["Robot", "Telepresence", "ROS2"]
+  },
+  {
+    "question": "What is Team Beta responsible for on this project?",
+    "expected_sources": ["project_overview.md"],
+    "reference_keywords": ["AI Stack", "Backend", "FastAPI"]
+  },
+  {
+    "question": "Who are the members of Team Beta?",
+    "expected_sources": ["project_overview.md"],
+    "reference_keywords": ["Shayan Humayun", "Aqib Ali"]
+  },
+  {
+    "question": "What edge computing hardware does the robot use?",
+    "expected_sources": ["tech_stack.md"],
+    "reference_keywords": ["NVIDIA Jetson", "Nano", "Xavier"]
+  },
+  {
+    "question": "What LIDAR sensor is used for obstacle detection and mapping?",
+    "expected_sources": ["tech_stack.md"],
+    "reference_keywords": ["RPLIDAR S2"]
+  },
+  {
+    "question": "What vector database is used for retrieval in the RAG pipeline?",
+    "expected_sources": ["tech_stack.md"],
+    "reference_keywords": ["ChromaDB"]
+  },
+  {
+    "question": "What embedding model is used for the RAG pipeline?",
+    "expected_sources": ["tech_stack.md"],
+    "reference_keywords": ["nomic-embed-text"]
+  },
+  {
+    "question": "Which candidate LLMs were benchmarked for this project?",
+    "expected_sources": ["tech_stack.md"],
+    "reference_keywords": ["Llama 3.1", "Mistral", "Phi-3", "Qwen2"]
+  },
+  {
+    "question": "What networking tool connects the robot to the AI backend securely?",
+    "expected_sources": ["tech_stack.md"],
+    "reference_keywords": ["Tailscale"]
+  },
+  {
+    "question": "What autopilot and firmware does the robot chassis run?",
+    "expected_sources": ["tech_stack.md"],
+    "reference_keywords": ["Pixhawk", "ArduRover"]
+  },
+  {
+    "question": "What did Team Alpha accomplish in week 1?",
+    "expected_sources": ["week1_progress.md"],
+    "reference_keywords": ["ROS2", "turtlesim", "simulation"]
+  },
+  {
+    "question": "What hardware problems did the team face in week 1?",
+    "expected_sources": ["week1_progress.md"],
+    "reference_keywords": ["Xavier NX", "LIDAR", "not available"]
+  },
+  {
+    "question": "Which LLM was fastest in the week 2 CPU benchmarking?",
+    "expected_sources": ["week2_progress.md"],
+    "reference_keywords": ["Phi-3 Mini", "fastest"]
+  },
+  {
+    "question": "What distance threshold was tuned for the RAG router in week 2?",
+    "expected_sources": ["week2_progress.md"],
+    "reference_keywords": ["0.40", "distance threshold"]
+  },
+  {
+    "question": "What GPU was used to host Ollama for AI inference?",
+    "expected_sources": ["week2_progress.md"],
+    "reference_keywords": ["Quadro P5000", "16GB"]
   }
 ]

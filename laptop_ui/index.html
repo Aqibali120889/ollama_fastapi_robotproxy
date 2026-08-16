@@ -29,11 +29,23 @@
   .meta { font-size: 0.75rem; opacity: 0.7; margin-top: 0.3rem; }
   #input-row { display: flex; gap: 0.5rem; }
   #question { flex: 1; padding: 0.6rem; border-radius: 6px; border: 1px solid #345; background: #12303f; color: #eaf2f5; }
+  #voice-row { display: flex; align-items: center; gap: 0.75rem; margin: 1rem 0; }
+  #mic-btn {
+    background: #1f6fb2; font-size: 1rem; padding: 0.6rem 1.1rem;
+  }
+  #mic-btn.active { background: #c0392b; animation: pulse 1.4s infinite; }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(192, 57, 43, 0.5); }
+    70% { box-shadow: 0 0 0 10px rgba(192, 57, 43, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(192, 57, 43, 0); }
+  }
+  #voice-status { font-size: 0.85rem; color: #9ad; }
+  hr { border: none; border-top: 1px solid #234; margin: 1.25rem 0; }
 </style>
 </head>
 <body>
 
-<h1>Robot Proxy — RAG Chat (via Tailscale)</h1>
+<h1>Robot Proxy — RAG Chat + Voice (via Tailscale)</h1>
 
 <div id="conn-row">
   <input id="server-url" type="text" placeholder="ws://100.x.x.x:8000/ws/rag" />
@@ -46,6 +58,13 @@
 <div id="input-row">
   <input id="question" type="text" placeholder="Ask a question..." disabled />
   <button id="send-btn" disabled>Send</button>
+</div>
+
+<hr>
+
+<div id="voice-row">
+  <button id="mic-btn">🎤 Start Voice Chat</button>
+  <div id="voice-status">Voice chat idle.</div>
 </div>
 
 <script>
@@ -141,6 +160,276 @@ function sendQuestion() {
 sendBtn.addEventListener('click', sendQuestion);
 questionInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') sendQuestion();
+});
+
+// ---------- Voice chat (/ws/voice) ----------
+// Talks to the same /ws/voice endpoint the Jetson client uses, so this page
+// can test the full denoise -> Whisper -> RAG/LLM -> XTTS-v2 loop from any
+// laptop's mic/speakers over Tailscale, without needing the robot hardware.
+// Uses ScriptProcessorNode (deprecated but universally supported) instead of
+// an AudioWorklet to keep this a single self-contained HTML file.
+
+const TARGET_SAMPLE_RATE = 16000;
+const SILENCE_RMS_THRESHOLD = 500;   // int16 RMS -- tune per mic/room, mirrors jetson_client.py
+const SILENCE_DURATION_MS = 800;
+const MIN_UTTERANCE_MS = 400;
+const MAX_UTTERANCE_MS = 15000;
+
+const micBtn = document.getElementById('mic-btn');
+const voiceStatusEl = document.getElementById('voice-status');
+
+let voiceWs = null;
+let audioCtx = null;
+let micStream = null;
+let sourceNode = null;
+let processorNode = null;
+let voiceActive = false;
+let isPlayingBack = false;
+let pendingSampleRate = TARGET_SAMPLE_RATE;
+
+let isSpeaking = false;
+let utteranceChunks = [];
+let silentRunMs = 0;
+let speechDurationMs = 0;
+
+function resetUtteranceState() {
+  utteranceChunks = [];
+  silentRunMs = 0;
+  speechDurationMs = 0;
+  isSpeaking = false;
+}
+
+function deriveVoiceUrl(base) {
+  const trimmed = base.trim();
+  if (!trimmed) return '';
+  if (trimmed.endsWith('/ws/rag')) return trimmed.slice(0, -'/ws/rag'.length) + '/ws/voice';
+  if (trimmed.endsWith('/ws/voice')) return trimmed;
+  return trimmed.replace(/\/$/, '') + '/ws/voice';
+}
+
+function downsampleTo16k(float32Buffer, inputSampleRate) {
+  if (inputSampleRate === TARGET_SAMPLE_RATE) return float32Buffer;
+  const ratio = inputSampleRate / TARGET_SAMPLE_RATE;
+  const outLength = Math.floor(float32Buffer.length / ratio);
+  const result = new Float32Array(outLength);
+  for (let i = 0; i < outLength; i++) {
+    const srcIndex = i * ratio;
+    const i0 = Math.floor(srcIndex);
+    const i1 = Math.min(i0 + 1, float32Buffer.length - 1);
+    const frac = srcIndex - i0;
+    result[i] = float32Buffer[i0] * (1 - frac) + float32Buffer[i1] * frac;
+  }
+  return result;
+}
+
+function floatTo16BitPCM(float32Array) {
+  const out = new Int16Array(float32Array.length);
+  for (let i = 0; i < float32Array.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32Array[i]));
+    out[i] = s < 0 ? s * 32768 : s * 32767;
+  }
+  return out;
+}
+
+function pcmRms(int16Array) {
+  if (!int16Array.length) return 0;
+  let sum = 0;
+  for (let i = 0; i < int16Array.length; i++) sum += int16Array[i] * int16Array[i];
+  return Math.sqrt(sum / int16Array.length);
+}
+
+function concatInt16(chunks) {
+  const total = chunks.reduce((n, c) => n + c.length, 0);
+  const out = new Int16Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.length;
+  }
+  return out;
+}
+
+function playPcm16(arrayBuffer, sampleRate) {
+  const int16 = new Int16Array(arrayBuffer);
+  if (!int16.length) return;
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) {
+    float32[i] = int16[i] / (int16[i] < 0 ? 32768 : 32767);
+  }
+
+  const buffer = audioCtx.createBuffer(1, float32.length, sampleRate);
+  buffer.copyToChannel(float32, 0);
+
+  const src = audioCtx.createBufferSource();
+  src.buffer = buffer;
+  src.connect(audioCtx.destination);
+  src.onended = () => {
+    isPlayingBack = false;
+    if (voiceActive) voiceStatusEl.textContent = 'Listening...';
+  };
+  src.start();
+}
+
+async function startVoiceChat() {
+  const voiceUrl = deriveVoiceUrl(urlInput.value);
+  if (!voiceUrl) {
+    voiceStatusEl.textContent = 'Enter the server host/URL in the field above first (e.g. ws://100.x.x.x:8000/ws/rag).';
+    return;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    voiceStatusEl.textContent = 'getUserMedia is unavailable -- open this page over HTTPS or localhost.';
+    return;
+  }
+
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: true, channelCount: 1 },
+    });
+  } catch (err) {
+    voiceStatusEl.textContent = 'Microphone permission denied or unavailable: ' + err.message;
+    return;
+  }
+
+  voiceActive = true;
+  isPlayingBack = false;
+  resetUtteranceState();
+  micBtn.textContent = '⏹ Stop Voice Chat';
+  micBtn.classList.add('active');
+
+  voiceStatusEl.textContent = 'Connecting to ' + voiceUrl + ' ...';
+  voiceWs = new WebSocket(voiceUrl);
+  voiceWs.binaryType = 'arraybuffer';
+
+  voiceWs.onopen = () => {
+    voiceStatusEl.textContent = 'Voice chat connected. Listening...';
+  };
+
+  voiceWs.onclose = () => {
+    voiceStatusEl.textContent = 'Voice chat disconnected.';
+    stopVoiceChat();
+  };
+
+  voiceWs.onerror = () => {
+    voiceStatusEl.textContent = 'Voice connection error — check the URL and that Tailscale is up.';
+  };
+
+  voiceWs.onmessage = (event) => {
+    if (event.data instanceof ArrayBuffer) {
+      playPcm16(event.data, pendingSampleRate);
+      return;
+    }
+    const data = JSON.parse(event.data);
+    if (data.type === 'session') {
+      voiceStatusEl.textContent = 'Voice session ' + data.session_id + ' — Listening...';
+    } else if (data.type === 'transcript') {
+      addBubble('🎤 ' + data.text, 'user');
+    } else if (data.type === 'meta') {
+      const bubble = addBubble(data.answer, 'bot');
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      const sources = data.sources && data.sources.length ? ' | sources: ' + data.sources.join(', ') : '';
+      meta.textContent = (data.used_rag ? 'RAG' : 'direct chat') + sources;
+      bubble.appendChild(meta);
+    } else if (data.type === 'audio_meta') {
+      pendingSampleRate = data.sample_rate;
+      isPlayingBack = true;
+      voiceStatusEl.textContent = 'Speaking...';
+    } else if (data.type === 'done') {
+      if (!isPlayingBack) voiceStatusEl.textContent = 'Listening...';
+    } else if (data.type === 'error') {
+      addBubble('Voice error: ' + data.message, 'bot');
+      voiceStatusEl.textContent = 'Listening...';
+    }
+  };
+
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  sourceNode = audioCtx.createMediaStreamSource(micStream);
+  processorNode = audioCtx.createScriptProcessor(4096, 1, 1);
+  const chunkMs = (4096 / audioCtx.sampleRate) * 1000;
+
+  processorNode.onaudioprocess = (event) => {
+    // Always silence the output side -- ScriptProcessorNode must be wired to
+    // a destination to keep firing, but we never want to echo the raw mic
+    // input back out through the speakers.
+    event.outputBuffer.getChannelData(0).fill(0);
+
+    if (!voiceActive || isPlayingBack || !voiceWs || voiceWs.readyState !== WebSocket.OPEN) return;
+
+    const input = event.inputBuffer.getChannelData(0);
+    const downsampled = downsampleTo16k(input, audioCtx.sampleRate);
+    const pcm16 = floatTo16BitPCM(downsampled);
+    const level = pcmRms(pcm16);
+
+    if (level >= SILENCE_RMS_THRESHOLD) {
+      isSpeaking = true;
+      silentRunMs = 0;
+    } else {
+      silentRunMs += chunkMs;
+    }
+
+    if (isSpeaking) {
+      utteranceChunks.push(pcm16);
+      speechDurationMs += chunkMs;
+    }
+
+    const doneBySilence = isSpeaking && silentRunMs >= SILENCE_DURATION_MS && speechDurationMs >= MIN_UTTERANCE_MS;
+    const doneByMaxLength = speechDurationMs >= MAX_UTTERANCE_MS;
+
+    if (doneBySilence || doneByMaxLength) {
+      const combined = concatInt16(utteranceChunks);
+      resetUtteranceState();
+      if (combined.length > 0) {
+        voiceStatusEl.textContent = 'Processing...';
+        voiceWs.send(combined.buffer);
+      }
+    }
+  };
+
+  sourceNode.connect(processorNode);
+  processorNode.connect(audioCtx.destination);
+}
+
+function stopVoiceChat() {
+  if (!voiceActive) return;
+  voiceActive = false;
+  isPlayingBack = false;
+  resetUtteranceState();
+
+  if (processorNode) {
+    processorNode.onaudioprocess = null;
+    processorNode.disconnect();
+    processorNode = null;
+  }
+  if (sourceNode) {
+    sourceNode.disconnect();
+    sourceNode = null;
+  }
+  if (audioCtx) {
+    audioCtx.close();
+    audioCtx = null;
+  }
+  if (micStream) {
+    micStream.getTracks().forEach((t) => t.stop());
+    micStream = null;
+  }
+  if (voiceWs) {
+    const ws2 = voiceWs;
+    voiceWs = null;
+    ws2.onclose = null;
+    ws2.close();
+  }
+
+  micBtn.textContent = '🎤 Start Voice Chat';
+  micBtn.classList.remove('active');
+  voiceStatusEl.textContent = 'Voice chat stopped.';
+}
+
+micBtn.addEventListener('click', () => {
+  if (voiceActive) {
+    stopVoiceChat();
+  } else {
+    startVoiceChat();
+  }
 });
 </script>
 
