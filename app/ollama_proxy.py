@@ -1,9 +1,10 @@
 import asyncio
+import json
 import logging
 import shutil
 import subprocess
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import AsyncGenerator, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -137,6 +138,63 @@ async def route_chat_request(settings: Settings, payload: ChatRequest) -> Tuple[
             )
 
     raise OllamaProxyError("All configured Ollama routes failed.", attempts=errors)
+
+
+async def _stream_ollama_chat(
+    client: httpx.AsyncClient,
+    base_url: str,
+    model: str,
+    messages: List[Dict[str, str]],
+    keep_alive: Optional[str],
+) -> AsyncGenerator[str, None]:
+    endpoint = f"{base_url.rstrip('/')}/api/chat"
+    payload: Dict[str, object] = {"model": model, "messages": messages, "stream": True}
+    if keep_alive is not None:
+        payload["keep_alive"] = _keep_alive_value(keep_alive)
+
+    async with client.stream("POST", endpoint, json=payload) as response:
+        response.raise_for_status()
+        async for line in response.aiter_lines():
+            if not line:
+                continue
+            chunk = json.loads(line)
+            token = chunk.get("message", {}).get("content", "")
+            if token:
+                yield token
+            if chunk.get("done"):
+                break
+
+
+async def stream_chat_request(settings: Settings, messages: List[Dict[str, str]]) -> AsyncGenerator[str, None]:
+    """Streaming counterpart to route_chat_request: same primary -> local-fallback
+    order, but yields token deltas as they arrive instead of waiting for the
+    full response. Fallback only applies before any token has been yielded for
+    an attempt -- once streaming has started, a mid-stream failure is surfaced
+    rather than silently retried on a different model (which would garble or
+    duplicate output a caller may have already started using)."""
+    candidates: List[Tuple[str, str]] = [
+        (settings.remote_primary_model, remote_url) for remote_url in settings.remote_urls()
+    ]
+    candidates.append((settings.local_fallback_model, settings.ollama_local_base_url))
+
+    timeout = httpx.Timeout(settings.request_timeout_seconds)
+    last_error: Optional[Exception] = None
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for model, base_url in candidates:
+            started = False
+            try:
+                async for token in _stream_ollama_chat(client, base_url, model, messages, settings.ollama_keep_alive):
+                    started = True
+                    yield token
+                return
+            except (httpx.TimeoutException, httpx.HTTPError) as exc:
+                last_error = exc
+                if started:
+                    raise OllamaProxyError(f"Streaming interrupted mid-response: {exc}") from exc
+                continue
+
+    raise OllamaProxyError(f"All configured Ollama routes failed for streaming chat: {last_error}")
 
 
 async def check_ollama_reachability(url: str, timeout_seconds: float) -> HealthCheckResult:

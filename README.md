@@ -109,10 +109,16 @@ Adds a full spoken-conversation loop on top of the existing RAG/LLM backend: mic
 
 **Deployment**: everything (denoising, Whisper, RAG, LLM, XTTS-v2) runs server-side on this GPU workstation. The Jetson Nano (`jetson_client/`) is a thin client — mic capture (PyAudio) + speaker playback (sounddevice) + a network hop over Tailscale — no ML models run on the edge device.
 
-1. **New `WS /ws/voice` endpoint** (`app/main.py`)
-   - Mints one `session_id` per connection and reuses it for every utterance on that connection, routing each transcript through the existing `conversation_graph.ainvoke(...)` (the same path `/chat` uses) — so multi-turn continuity comes from the already-existing `SessionMemoryStore`, not a new session manager. This differs from `/ws/rag`, which mints a fresh session per message and has no memory.
-   - Per utterance: `denoise()` → `transcribe()` → send `{"type":"transcript"}` → run the RAG/LLM graph → send `{"type":"meta"}` → `synthesize()` → send `{"type":"audio_meta"}` + binary audio frame → `{"type":"done", "timings": {...}}`.
+1. **New `WS /ws/voice` endpoint** (`app/main.py`, orchestration in `app/voice_pipeline.py`)
+   - Mints one `session_id` per connection and reuses it for every utterance on that connection, reusing the same `conversation_graph.memory_store` session memory `/chat` uses — so multi-turn continuity isn't a separate mechanism. This differs from `/ws/rag`, which mints a fresh session per message and has no memory.
+   - Per utterance: `denoise()` → `transcribe()` → send `{"type":"transcript"}` → `_prepare_context()` (same RAG retrieval `/chat`/`/rag/ask` use) → send `{"type":"meta"}` → **streamed** generation, synthesizing and sending each sentence as soon as it's ready (`{"type":"sentence_audio_meta"}` + binary audio frame, repeated) → `{"type":"done", "answer": "<full text>", "timings": {...}}`.
    - Why: reuses the existing hybrid-retrieval RAG pipeline and session memory rather than duplicating them for voice.
+
+1b. **Sentence-by-sentence streaming, not one wait-for-everything response** (`app/voice_pipeline.py`, `stream_chat_request` in `app/ollama_proxy.py`)
+   - Real measurements showed TTS synthesis alone regularly took 5-17s depending on answer length — waiting for the *entire* answer to generate, then synthesizing it *entirely*, then sending one blob meant visitors could wait 20+ seconds before hearing anything.
+   - Now: `stream_chat_request()` streams LLM tokens via `/api/chat` with `stream: true`; `split_sentence_chunks()` buffers tokens until a sentence boundary (or a length safety valve); a producer/consumer `asyncio.Queue` lets sentence N+1's generation overlap with sentence N's synthesis instead of serializing them. First audio now arrives after roughly one sentence's worth of work, not the whole answer — tracked explicitly as `timings.time_to_first_audio_s`.
+   - Explicitly not in this pass: barge-in/interruption. The mic still stays paused during playback; only the response's *shape* (streamed sentences vs. one blob) changed. Both `jetson_client/voice_client.py` and `laptop_ui/index.html` were updated to play a queue of incoming chunks back-to-back instead of assuming exactly one.
+   - Why: total compute time is essentially unchanged, but perceived latency — the number that actually matters for whether this feels responsive — drops substantially.
 
 2. **Server-side STT/denoise/TTS wrappers** (`app/voice_stt.py`, `app/voice_denoise.py`, `app/voice_tts.py`)
    - `faster-whisper`, DeepFilterNet, and Coqui XTTS-v2 (built-in speaker) respectively. Each lazily loads its model once and keeps it resident (mirrors the `OLLAMA_KEEP_ALIVE` warm-model strategy) — per-request loads would blow the latency budget.
@@ -128,13 +134,13 @@ Adds a full spoken-conversation loop on top of the existing RAG/LLM backend: mic
    - Requires a secure context (`https://` or `localhost`/`file://`) for `getUserMedia`, and requests `echoCancellation` to avoid the speaker output being picked back up by the mic.
 
 4. **Testing** (`tests/`, first pytest infrastructure in this repo)
-   - Fast unit tests (no GPU/models/hardware needed, run in CI): mock the model-loader seams in each voice wrapper to verify wiring, exercise the full `/ws/voice` message sequence via FastAPI's `TestClient`, and test `SessionMemoryStore` (pre-existing code, previously untested).
+   - Fast unit tests (no GPU/models/hardware needed, run in CI): mock the model-loader seams in each voice wrapper to verify wiring, exercise the full `/ws/voice` message sequence (including the multi-sentence streamed protocol) via FastAPI's `TestClient`, unit-test `split_sentence_chunks()` and `run_voice_turn()` in isolation (`tests/test_voice_pipeline.py`, including a regression test that a mid-stream generation error can't hang the producer/consumer queue), and test `SessionMemoryStore` (pre-existing code, previously untested).
    - Slow/integration tests marked `@pytest.mark.integration` (skipped by default, need real Ollama/models/audio): the 20-question RAG accuracy gate, real Whisper/XTTS-v2 calls, WER-before/after-denoising comparison.
 
 5. **Evaluation / profiling**
    - `evaluation/rag_eval_dataset.json` expanded from 3 stale questions (referencing files that don't even exist in `knowledge_base/`) to 20 questions grounded in the real KB content, with an explicit pass/fail accuracy gate in `scripts/evaluate_rag.py` (`--min-accuracy`, default 80%).
    - `scripts/evaluate_stt_wer.py` (new): WER with vs. without DeepFilterNet, via `jiwer`. Needs real recorded audio in `evaluation/stt_eval_dataset.json` (ideally at ~65dB simulated background noise) to produce meaningful numbers — ships as scaffolding.
-   - `scripts/profile_voice_latency.py` (new): drives `/ws/voice` with a sample WAV and reports per-stage timings (`denoise_s`, `stt_s`, `rag_generation_s`, `tts_s`, `total_s`) against the 4s target, following the existing `scripts/profile_performance.py` JSON/CSV artifact convention.
+   - `scripts/profile_voice_latency.py`: drives `/ws/voice` with a sample WAV and reports per-stage timings (`denoise_s`, `stt_s`, `retrieval_s`, `time_to_first_audio_s`, `generation_and_tts_s`, `total_s`) against the 4s target — reports separate PASS/FAIL verdicts for time-to-first-audio (the number streaming targets) and total time (informational; long answers may legitimately exceed 4s end-to-end), following the existing `scripts/profile_performance.py` JSON/CSV artifact convention.
 
 **Not in this pass**: voice deps are *not* added to the default `Dockerfile`/`requirements.txt` (multi-GB torch/model downloads shouldn't be forced onto the existing text-only image) — install `requirements-voice.txt` separately when building a voice-enabled deployment.
 
@@ -210,6 +216,26 @@ pytest tests/ -m integration            # needs live Ollama + ingested KB + STT/
 ```
 
 For the Jetson Nano side, see `jetson_client/` — a separate, lightweight `requirements.txt` (no torch) since it only captures/plays audio and talks to `/ws/voice` over the network.
+
+#### Voice pipeline install notes (read before reporting a `df`/`torchaudio`/`TTS` import error)
+
+`requirements-voice.txt` pins `torch`/`torchaudio`/`numpy`/`transformers` to specific ranges and uses `coqui-tts` instead of the old `TTS` package — these aren't arbitrary, they're the result of working through a real, verified conflict chain on the actual deployment GPU (see the comments at the top of that file for why each pin exists). Loosening any of them will likely reintroduce one of these:
+
+- `deepfilternet==0.5.6` (the latest PyPI release) still imports `torchaudio.backend.common.AudioMetaData`, a path removed from `torchaudio`. **This one line needs a one-time manual patch after every fresh `pip install`** (the fix exists on DeepFilterNet's GitHub `main` but was never released to PyPI):
+  ```bash
+  sed -i 's/from torchaudio\.backend\.common import AudioMetaData/from torchaudio import AudioMetaData/' \
+    "$(python -c "import df, os; print(os.path.dirname(df.__file__))")/io.py"
+  ```
+- If you see `ImportError: cannot import name 'Coqpit' from 'coqpit' (unknown location)`, an old `coqpit` install is shadowing `coqpit-config`'s namespace: `pip uninstall coqpit -y && pip install --force-reinstall --no-cache-dir coqpit-config`.
+- If Whisper errors with `Requested float16 compute type, but the target device ... do not support efficient float16 computation`, your GPU (older/Pascal-class cards especially) doesn't have efficient native fp16 — `STT_COMPUTE_TYPE` already defaults to `int8_float16` for this reason; fall back further to `int8` in `.env` if needed.
+
+After installing, verify all of this in one go before starting the server:
+```bash
+python3 -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+python3 -c "import df; print('deepfilternet OK')"
+python3 -c "import transformers; print('torch usable:', transformers.utils.is_torch_available())"
+python3 -c "from TTS.api import TTS; print('coqui-tts OK')"
+```
 
 ---
 
@@ -355,6 +381,7 @@ Artifacts:
 - `app/voice_stt.py`
 - `app/voice_denoise.py`
 - `app/voice_tts.py`
+- `app/voice_pipeline.py`
 - `jetson_client/voice_client.py`
 - `tests/` (pytest suite)
 - `app/schemas.py`

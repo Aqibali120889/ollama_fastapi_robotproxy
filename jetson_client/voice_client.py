@@ -88,6 +88,11 @@ async def _handle_connection():
 
                 await ws.send(utterance)
 
+                # Responses stream in as one sentence at a time (sentence_audio_meta
+                # + a binary frame, repeated) rather than a single blob. Messages
+                # arrive over the socket in order and this loop processes one at a
+                # time, blocking on sd.wait() per chunk -- that alone is enough to
+                # play sentences back-to-back correctly, no separate queue needed.
                 playback_sample_rate = SAMPLE_RATE
                 async for raw in ws:
                     if isinstance(raw, bytes):
@@ -102,9 +107,11 @@ async def _handle_connection():
                     if event_type == "transcript":
                         print(f"Visitor said: {event['text']}")
                     elif event_type == "meta":
-                        print(f"Robot: {event['answer']}")
-                    elif event_type == "audio_meta":
+                        route = "knowledge base" if event.get("used_rag") else "general chat"
+                        print(f"Robot is answering ({route})...")
+                    elif event_type == "sentence_audio_meta":
                         playback_sample_rate = event["sample_rate"]
+                        print(f"Robot: {event['text']}")
                     elif event_type == "error":
                         print(f"Voice pipeline error: {event['message']}")
                         break

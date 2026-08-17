@@ -2,11 +2,31 @@
 # Kept separate from requirements.txt because these pull in multi-GB torch
 # builds and model weights that a text-only RAG deployment doesn't need.
 # Install with: pip install -r requirements.txt -r requirements-voice.txt
+#
+# torch/torchaudio/numpy/transformers below are deliberately PINNED, not left
+# open-ended -- an unpinned install here breaks in a well-verified chain (see
+# README.md's "Voice pipeline install notes" for the full story):
+#   torch/torchaudio >= 2.9 removes torchaudio.AudioMetaData, which the
+#     PyPI deepfilternet==0.5.6 release still imports (its GitHub main
+#     branch has since fixed this, but no release has shipped it).
+#   torch < 2.5 makes `transformers` refuse to use PyTorch at all
+#     (coqui-tts needs a working torch-backed transformers).
+#   torch==2.5.1 / torchaudio==2.5.1 is the verified sweet spot that
+#     satisfies both constraints at once.
+#   The original `TTS` PyPI package (Coqui AI's own releases) is
+#     abandoned since Coqui AI shut down in early 2024 and hard-pins
+#     numpy==1.22.0, which conflicts with chromadb. Use the actively
+#     maintained `coqui-tts` fork instead (same `TTS.api` import path).
+#   transformers>=5 removed a function coqui-tts's XTTS-v2 code still
+#     imports (isin_mps_friendly) -- must stay below 5.
 
 faster-whisper>=1.0.0
-deepfilternet>=0.5.6
-TTS>=0.22.0
-torch>=2.1.0
-torchaudio>=2.1.0
+deepfilternet==0.5.6
+coqui-tts>=0.27.5
+coqpit-config>=0.2.5
+transformers>=4.57,<5.0
+torch==2.5.1
+torchaudio==2.5.1
+numpy>=1.26.0,<2.0
 jiwer>=3.0.0
 soundfile>=0.12.1

@@ -1,7 +1,5 @@
-import asyncio
 import json
 import logging
-import time
 import uuid
 from typing import Dict
 
@@ -13,9 +11,7 @@ from app.conversation_graph import build_conversation_graph
 from app.ollama_proxy import OllamaProxyError, check_ollama_reachability, detect_cuda
 from app.rag_pipeline import rag_answer, rag_answer_stream
 from app.schemas import ChatRequest, ChatResponse, HealthResponse, RagRequest, RagResponse
-from app.voice_denoise import denoise
-from app.voice_stt import transcribe
-from app.voice_tts import synthesize
+from app.voice_pipeline import run_voice_turn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -122,20 +118,40 @@ async def rag_ask(payload: RagRequest) -> RagResponse:
 
 
 async def _safe_send_text(websocket: WebSocket, payload: dict) -> None:
-    """send_text raises RuntimeError (not WebSocketDisconnect) if the client
-    already closed the connection while we were still processing a turn --
-    there's nothing useful to do with that but drop the message."""
+    """If the client already closed the connection while we were still
+    processing a turn, sending raises either RuntimeError or
+    WebSocketDisconnect depending on exactly how the disconnect was
+    detected -- there's nothing useful to do with either but drop the
+    message."""
     try:
         await websocket.send_text(json.dumps(payload))
-    except RuntimeError:
+    except (RuntimeError, WebSocketDisconnect):
         logger.debug("Dropped websocket send: client already disconnected.")
 
 
 async def _safe_send_bytes(websocket: WebSocket, data: bytes) -> None:
     try:
         await websocket.send_bytes(data)
-    except RuntimeError:
+    except (RuntimeError, WebSocketDisconnect):
         logger.debug("Dropped websocket send: client already disconnected.")
+
+
+async def _receive_bytes_or_none(websocket: WebSocket):
+    """Once a send has failed mid-turn, the connection is already torn down,
+    so the *next* receive call raises a plain RuntimeError instead of the
+    WebSocketDisconnect the outer loop is watching for. Treat both as
+    "the client is gone" and let the caller exit cleanly."""
+    try:
+        return await websocket.receive_bytes()
+    except RuntimeError:
+        return None
+
+
+async def _receive_text_or_none(websocket: WebSocket):
+    try:
+        return await websocket.receive_text()
+    except RuntimeError:
+        return None
 
 
 @app.websocket("/ws/rag")
@@ -143,7 +159,9 @@ async def ws_rag(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            question = await websocket.receive_text()
+            question = await _receive_text_or_none(websocket)
+            if question is None:
+                break
             if not question.strip():
                 continue
             try:
@@ -163,84 +181,32 @@ async def ws_voice(websocket: WebSocket):
     One session_id is minted for the lifetime of the connection and reused for
     every utterance, so conversation_graph's SessionMemoryStore gives multi-turn
     continuity for free -- unlike /ws/rag, which mints a fresh session per message.
+
+    The per-turn pipeline itself (denoise/transcribe/retrieve/stream-generate/
+    synthesize-per-sentence) lives in app.voice_pipeline.run_voice_turn -- this
+    handler is just the transport: receive loop, disconnect handling, and
+    wiring run_voice_turn's callbacks to this specific websocket.
     """
     await websocket.accept()
     session_id = str(uuid.uuid4())
     await _safe_send_text(websocket, {"type": "session", "session_id": session_id})
 
+    async def on_event(payload: dict) -> None:
+        await _safe_send_text(websocket, payload)
+
+    async def on_audio(data: bytes) -> None:
+        await _safe_send_bytes(websocket, data)
+
     try:
         while True:
-            audio_bytes = await websocket.receive_bytes()
+            audio_bytes = await _receive_bytes_or_none(websocket)
+            if audio_bytes is None:
+                break
             if not audio_bytes:
                 continue
 
-            total_start = time.perf_counter()
-            timings: Dict[str, float] = {}
-
             try:
-                t0 = time.perf_counter()
-                if settings.enable_denoise:
-                    audio_bytes = await asyncio.to_thread(denoise, audio_bytes, settings.voice_sample_rate)
-                timings["denoise_s"] = round(time.perf_counter() - t0, 3)
-
-                t0 = time.perf_counter()
-                question = await asyncio.to_thread(
-                    transcribe,
-                    audio_bytes,
-                    settings.stt_model_size,
-                    settings.stt_device,
-                    settings.stt_compute_type,
-                    settings.stt_language,
-                )
-                timings["stt_s"] = round(time.perf_counter() - t0, 3)
-
-                if not question.strip():
-                    await _safe_send_text(websocket, {"type": "error", "message": "No speech detected."})
-                    continue
-
-                await _safe_send_text(websocket, {"type": "transcript", "text": question})
-
-                t0 = time.perf_counter()
-                state = await conversation_graph.ainvoke(
-                    {
-                        "session_id": session_id,
-                        "user_question": question,
-                        "incoming_messages": [],
-                        "mode": "chat",
-                        "model": None,
-                        "top_k": settings.rag_top_k,
-                        "metadata_filters": None,
-                    }
-                )
-                timings["rag_generation_s"] = round(time.perf_counter() - t0, 3)
-
-                answer_text = state.get("response_text", "")
-                await _safe_send_text(
-                    websocket,
-                    {
-                        "type": "meta",
-                        "used_rag": state.get("used_rag", False),
-                        "sources": state.get("sources", []),
-                        "answer": answer_text,
-                    },
-                )
-
-                t0 = time.perf_counter()
-                audio_out, sample_rate = await asyncio.to_thread(
-                    synthesize,
-                    answer_text,
-                    settings.tts_model_name,
-                    settings.tts_device,
-                    settings.tts_speaker,
-                    settings.tts_language,
-                )
-                timings["tts_s"] = round(time.perf_counter() - t0, 3)
-                timings["total_s"] = round(time.perf_counter() - total_start, 3)
-
-                await _safe_send_text(websocket, {"type": "audio_meta", "sample_rate": sample_rate, "timings": timings})
-                if audio_out:
-                    await _safe_send_bytes(websocket, audio_out)
-                await _safe_send_text(websocket, {"type": "done", "session_id": session_id, "timings": timings})
+                await run_voice_turn(settings, session_id, audio_bytes, on_event, on_audio)
             except Exception as exc:
                 logger.exception("Voice pipeline stage failed")
                 await _safe_send_text(websocket, {"type": "error", "message": str(exc)})

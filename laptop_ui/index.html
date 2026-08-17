@@ -187,6 +187,15 @@ let voiceActive = false;
 let isPlayingBack = false;
 let pendingSampleRate = TARGET_SAMPLE_RATE;
 
+// Responses now stream in as one chunk per sentence rather than a single
+// blob, so playback is a small queue: each arriving chunk is enqueued and
+// played back-to-back, and the mic only re-enables once both the queue has
+// fully drained AND the server's "done" event has arrived (audio can finish
+// playing slightly before or after "done" shows up).
+let audioQueue = [];
+let isPlayingChunk = false;
+let turnDone = false;
+
 let isSpeaking = false;
 let utteranceChunks = [];
 let silentRunMs = 0;
@@ -249,9 +258,12 @@ function concatInt16(chunks) {
   return out;
 }
 
-function playPcm16(arrayBuffer, sampleRate) {
+function playPcm16(arrayBuffer, sampleRate, onComplete) {
   const int16 = new Int16Array(arrayBuffer);
-  if (!int16.length) return;
+  if (!int16.length) {
+    if (onComplete) onComplete();
+    return;
+  }
   const float32 = new Float32Array(int16.length);
   for (let i = 0; i < int16.length; i++) {
     float32[i] = int16[i] / (int16[i] < 0 ? 32768 : 32767);
@@ -263,11 +275,37 @@ function playPcm16(arrayBuffer, sampleRate) {
   const src = audioCtx.createBufferSource();
   src.buffer = buffer;
   src.connect(audioCtx.destination);
-  src.onended = () => {
+  src.onended = () => { if (onComplete) onComplete(); };
+  src.start();
+}
+
+function enqueueAudioChunk(arrayBuffer, sampleRate) {
+  audioQueue.push({ buffer: arrayBuffer, sampleRate });
+  playNextQueuedChunk();
+}
+
+function playNextQueuedChunk() {
+  if (isPlayingChunk) return;
+
+  const next = audioQueue.shift();
+  if (!next) {
+    maybeFinishPlayback();
+    return;
+  }
+
+  isPlayingChunk = true;
+  isPlayingBack = true;
+  playPcm16(next.buffer, next.sampleRate, () => {
+    isPlayingChunk = false;
+    playNextQueuedChunk();
+  });
+}
+
+function maybeFinishPlayback() {
+  if (turnDone && audioQueue.length === 0 && !isPlayingChunk) {
     isPlayingBack = false;
     if (voiceActive) voiceStatusEl.textContent = 'Listening...';
-  };
-  src.start();
+  }
 }
 
 async function startVoiceChat() {
@@ -315,7 +353,7 @@ async function startVoiceChat() {
 
   voiceWs.onmessage = (event) => {
     if (event.data instanceof ArrayBuffer) {
-      playPcm16(event.data, pendingSampleRate);
+      enqueueAudioChunk(event.data, pendingSampleRate);
       return;
     }
     const data = JSON.parse(event.data);
@@ -324,21 +362,24 @@ async function startVoiceChat() {
     } else if (data.type === 'transcript') {
       addBubble('🎤 ' + data.text, 'user');
     } else if (data.type === 'meta') {
-      const bubble = addBubble(data.answer, 'bot');
-      const meta = document.createElement('div');
-      meta.className = 'meta';
-      const sources = data.sources && data.sources.length ? ' | sources: ' + data.sources.join(', ') : '';
-      meta.textContent = (data.used_rag ? 'RAG' : 'direct chat') + sources;
-      bubble.appendChild(meta);
-    } else if (data.type === 'audio_meta') {
+      const routeNote = data.used_rag ? '(answering from knowledge base)' : '(general chat)';
+      const bubble = addBubble('', 'bot');
+      bubble.dataset.route = routeNote;
+      bubble.id = 'voice-answer-bubble';
+    } else if (data.type === 'sentence_audio_meta') {
       pendingSampleRate = data.sample_rate;
-      isPlayingBack = true;
       voiceStatusEl.textContent = 'Speaking...';
+      const bubble = document.getElementById('voice-answer-bubble');
+      if (bubble) bubble.textContent += (bubble.textContent ? ' ' : '') + data.text;
     } else if (data.type === 'done') {
-      if (!isPlayingBack) voiceStatusEl.textContent = 'Listening...';
+      const bubble = document.getElementById('voice-answer-bubble');
+      if (bubble) bubble.removeAttribute('id');
+      turnDone = true;
+      maybeFinishPlayback();
     } else if (data.type === 'error') {
       addBubble('Voice error: ' + data.message, 'bot');
-      voiceStatusEl.textContent = 'Listening...';
+      turnDone = true;
+      maybeFinishPlayback();
     }
   };
 
@@ -380,6 +421,9 @@ async function startVoiceChat() {
       resetUtteranceState();
       if (combined.length > 0) {
         voiceStatusEl.textContent = 'Processing...';
+        turnDone = false;
+        audioQueue = [];
+        isPlayingChunk = false;
         voiceWs.send(combined.buffer);
       }
     }
@@ -393,6 +437,9 @@ function stopVoiceChat() {
   if (!voiceActive) return;
   voiceActive = false;
   isPlayingBack = false;
+  audioQueue = [];
+  isPlayingChunk = false;
+  turnDone = false;
   resetUtteranceState();
 
   if (processorNode) {

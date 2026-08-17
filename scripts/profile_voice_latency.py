@@ -78,10 +78,15 @@ def main():
     for k, v in avg.items():
         print(f"- {k}: {v}")
 
+    first_audio = avg.get("time_to_first_audio_s")
+    if first_audio is not None:
+        verdict = "PASS" if first_audio <= 4.0 else "FAIL"
+        print(f"\n{verdict}: average time_to_first_audio_s={first_audio} (target <= 4.0s)")
+
     total = avg.get("total_s", avg.get("wall_clock_s"))
     if total is not None:
         verdict = "PASS" if total <= 4.0 else "FAIL"
-        print(f"\n{verdict}: average total_s={total} (target <= 4.0s)")
+        print(f"{verdict}: average total_s={total} (target <= 4.0s, informational -- long answers may legitimately exceed this)")
 
     print(f"\nSaved:\n- {json_path}\n- {csv_path}")
 

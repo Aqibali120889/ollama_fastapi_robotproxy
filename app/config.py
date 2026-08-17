@@ -67,7 +67,9 @@ class Settings(BaseSettings):
     # Voice pipeline (STT / denoise / TTS) -- all run server-side on this workstation.
     stt_model_size: str = Field(default="small")
     stt_device: str = Field(default="cuda")
-    stt_compute_type: str = Field(default="float16")
+    # int8_float16, not float16: older GPUs (e.g. Pascal-class, no efficient
+    # native fp16) reject a plain float16 compute type outright at runtime.
+    stt_compute_type: str = Field(default="int8_float16")
     stt_language: str = Field(default="en")
 
     enable_denoise: bool = Field(default=True)
