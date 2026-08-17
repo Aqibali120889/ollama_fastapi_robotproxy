@@ -121,6 +121,23 @@ async def rag_ask(payload: RagRequest) -> RagResponse:
         ) from exc
 
 
+async def _safe_send_text(websocket: WebSocket, payload: dict) -> None:
+    """send_text raises RuntimeError (not WebSocketDisconnect) if the client
+    already closed the connection while we were still processing a turn --
+    there's nothing useful to do with that but drop the message."""
+    try:
+        await websocket.send_text(json.dumps(payload))
+    except RuntimeError:
+        logger.debug("Dropped websocket send: client already disconnected.")
+
+
+async def _safe_send_bytes(websocket: WebSocket, data: bytes) -> None:
+    try:
+        await websocket.send_bytes(data)
+    except RuntimeError:
+        logger.debug("Dropped websocket send: client already disconnected.")
+
+
 @app.websocket("/ws/rag")
 async def ws_rag(websocket: WebSocket):
     await websocket.accept()
@@ -131,10 +148,10 @@ async def ws_rag(websocket: WebSocket):
                 continue
             try:
                 async for event in rag_answer_stream(settings, question):
-                    await websocket.send_text(json.dumps(event))
+                    await _safe_send_text(websocket, event)
             except Exception as exc:
                 logger.exception("Streaming RAG query failed")
-                await websocket.send_text(json.dumps({"type": "error", "message": str(exc)}))
+                await _safe_send_text(websocket, {"type": "error", "message": str(exc)})
     except WebSocketDisconnect:
         pass
 
@@ -149,7 +166,7 @@ async def ws_voice(websocket: WebSocket):
     """
     await websocket.accept()
     session_id = str(uuid.uuid4())
-    await websocket.send_text(json.dumps({"type": "session", "session_id": session_id}))
+    await _safe_send_text(websocket, {"type": "session", "session_id": session_id})
 
     try:
         while True:
@@ -178,10 +195,10 @@ async def ws_voice(websocket: WebSocket):
                 timings["stt_s"] = round(time.perf_counter() - t0, 3)
 
                 if not question.strip():
-                    await websocket.send_text(json.dumps({"type": "error", "message": "No speech detected."}))
+                    await _safe_send_text(websocket, {"type": "error", "message": "No speech detected."})
                     continue
 
-                await websocket.send_text(json.dumps({"type": "transcript", "text": question}))
+                await _safe_send_text(websocket, {"type": "transcript", "text": question})
 
                 t0 = time.perf_counter()
                 state = await conversation_graph.ainvoke(
@@ -198,15 +215,14 @@ async def ws_voice(websocket: WebSocket):
                 timings["rag_generation_s"] = round(time.perf_counter() - t0, 3)
 
                 answer_text = state.get("response_text", "")
-                await websocket.send_text(
-                    json.dumps(
-                        {
-                            "type": "meta",
-                            "used_rag": state.get("used_rag", False),
-                            "sources": state.get("sources", []),
-                            "answer": answer_text,
-                        }
-                    )
+                await _safe_send_text(
+                    websocket,
+                    {
+                        "type": "meta",
+                        "used_rag": state.get("used_rag", False),
+                        "sources": state.get("sources", []),
+                        "answer": answer_text,
+                    },
                 )
 
                 t0 = time.perf_counter()
@@ -221,15 +237,13 @@ async def ws_voice(websocket: WebSocket):
                 timings["tts_s"] = round(time.perf_counter() - t0, 3)
                 timings["total_s"] = round(time.perf_counter() - total_start, 3)
 
-                await websocket.send_text(
-                    json.dumps({"type": "audio_meta", "sample_rate": sample_rate, "timings": timings})
-                )
+                await _safe_send_text(websocket, {"type": "audio_meta", "sample_rate": sample_rate, "timings": timings})
                 if audio_out:
-                    await websocket.send_bytes(audio_out)
-                await websocket.send_text(json.dumps({"type": "done", "session_id": session_id, "timings": timings}))
+                    await _safe_send_bytes(websocket, audio_out)
+                await _safe_send_text(websocket, {"type": "done", "session_id": session_id, "timings": timings})
             except Exception as exc:
                 logger.exception("Voice pipeline stage failed")
-                await websocket.send_text(json.dumps({"type": "error", "message": str(exc)}))
+                await _safe_send_text(websocket, {"type": "error", "message": str(exc)})
     except WebSocketDisconnect:
         pass
 
