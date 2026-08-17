@@ -1,0 +1,169 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{times}
+\usepackage[T1]{fontenc}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    urlcolor=blue,
+    citecolor=black
+}
+
+\titleformat{\section}{\large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{1em}{}
+
+\setlist[itemize]{leftmargin=1.4em, itemsep=2pt, topsep=2pt}
+
+\title{\textbf{Weekly Progress Report -- Week 6} \\[4pt]
+\large AI Stack \& Backend: RAG/LLM Optimization and Voice Pipeline Integration}
+\author{Shayan Humayun \\ Registration No.\ 23-CP-69 \\ Department of Computer Engineering \\ University of Engineering and Technology (UET) Taxila}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\vspace{-1.5em}
+\begin{center}
+\begin{tabular}{ll}
+\textbf{Project:} & AI-Powered Robotic Proxy for Remote Business Presence in Expos \\
+\textbf{Supervisor:} & Dr.\ Muhammad Haroon Yousaf \\
+\textbf{Industry Advisor:} & Engr.\ Saran Khaliq, BrainSwarm Robotics Pvt.\ Ltd. \\
+\textbf{Responsibility Area:} & AI Stack \& Backend (FastAPI, Ollama, RAG, Voice Pipeline) \\
+\end{tabular}
+\end{center}
+
+\vspace{1em}
+
+\section{Objective for This Week}
+
+Two areas of work were assigned for this week:
+
+\begin{enumerate}
+    \item \textbf{Optimize the existing RAG (Retrieval-Augmented Generation) and LLM pipeline for speed}, and extend it to handle a multimodal knowledge base (text, PDFs, and images/diagrams), while preserving the existing hybrid dense+keyword retrieval approach.
+    \item \textbf{Design and implement the Speech-to-Text (STT) $\rightarrow$ RAG $\rightarrow$ LLM $\rightarrow$ Text-to-Speech (TTS) conversational pipeline}, including real-time microphone noise suppression, multi-turn session continuity, and automated testing for each stage, so the robot can hold a spoken conversation with a visitor rather than a text-only one.
+\end{enumerate}
+
+\section{Work Completed}
+
+\subsection{RAG / LLM Pipeline Speed Optimization}
+
+The retrieval pipeline previously performed two full embed-and-retrieve cycles per question (one to decide whether the knowledge base was relevant, a second after an unconditional query rewrite). This was restructured and optimized:
+
+\begin{itemize}
+    \item \textbf{Single-pass retrieval:} the pipeline was reordered to \emph{rewrite (if needed) $\rightarrow$ embed $\rightarrow$ retrieve}, removing the redundant first retrieval entirely.
+    \item \textbf{Conditional query rewriting:} a lightweight, rule-based check (question length and conversational filler phrases such as ``can you tell me'', ``I was wondering'') decides whether a question needs to be rewritten into a cleaner search query before retrieval. Short, already query-like questions skip the rewrite step -- and therefore skip an extra language-model call -- entirely.
+    \item \textbf{Lightweight rewriting:} when rewriting is triggered, it continues to use the small local model (not the main conversational model), with its output length capped and its prompt tightened to return only a short search query.
+    \item \textbf{Bounded answer length:} a generation-length cap was added on top of the existing concise-answer instruction, to reduce response generation time.
+    \item \textbf{Context packing:} the logic that assembles retrieved chunks into the model's context window was corrected so that a large chunk which does not fit the remaining budget no longer blocks smaller, still-useful chunks after it from being included.
+    \item \textbf{In-process caching:} both embeddings and full retrieval results are now cached in memory (time- and size-bounded), so a repeated or near-repeated question skips redundant embedding and retrieval work. Cache keys include the active metadata filters, so a filtered query can never incorrectly reuse an unfiltered result.
+    \item \textbf{Consistent model residency:} the ``keep model loaded in GPU memory'' setting was previously applied inconsistently -- it was missing on the main chat call path, meaning the primary model could be evicted and reloaded between requests. This is now applied consistently across every call to the language model, embedding model, and vision model.
+    \item \textbf{Simplified model routing:} the chat routing configuration was simplified from a primary/secondary/local three-tier fallback to a single primary model plus a local fallback, matching the actual deployment (one GPU workstation, not separate remote/local machines). This also frees GPU memory headroom for the new speech models described below.
+\end{itemize}
+
+\subsection{Multimodal Knowledge Base Ingestion}
+
+The knowledge-base ingestion pipeline was extended so that the system is no longer limited to plain text:
+
+\begin{itemize}
+    \item Standalone image files and images embedded inside PDF pages (diagrams, screenshots, photos) are now detected during ingestion, in addition to the existing text and PDF-text handling.
+    \item Each image is described by a vision-language model (LLaVA), and that description is embedded using the existing embedding model (Nomic) into the same vector database (Chroma) already used for text. The vision model augments the existing embedding pipeline; it does not replace it.
+    \item Each indexed image chunk stores its type and its original file path in its metadata, so the source image can be located again later.
+    \item At answer time, if a retrieved result is an image rather than text, the original image is re-examined by the vision model using the visitor's specific question, producing a more targeted description than the generic one stored at indexing time. This vision re-analysis step is only triggered when an image result is actually retrieved -- ordinary text-only questions are unaffected and remain on the fast, text-only path.
+\end{itemize}
+
+The existing hybrid retrieval mechanism (dense vector search combined with keyword scoring, weighted fusion) was left unchanged by this work, as it was already functioning correctly; only the ingestion and context-assembly stages around it were extended.
+
+\subsection{Voice Pipeline: STT $\rightarrow$ RAG $\rightarrow$ LLM $\rightarrow$ TTS}
+
+The full spoken-conversation loop was implemented on the backend:
+
+\begin{itemize}
+    \item \textbf{Speech-to-Text:} implemented using \texttt{faster-whisper}.
+    \item \textbf{Noise suppression:} implemented using DeepFilterNet, applied to incoming audio before transcription, and made switchable so it can be compared with and without suppression.
+    \item \textbf{Text-to-Speech:} implemented using Coqui XTTS-v2.
+    \item \textbf{Endpoint:} a dedicated streaming endpoint was added that accepts a captured audio utterance from the client, denoises it, transcribes it, and passes the resulting text through the \emph{existing} RAG/LLM conversation pipeline -- reusing the session-memory component already built for the text-chat interface, rather than building a separate one. This means a spoken question and a typed question in the same session share the same conversational memory and RAG grounding logic. The generated answer is then synthesized to speech and streamed back to the client.
+    \item \textbf{Model residency:} the speech-to-text, denoising, and speech-synthesis models are each loaded once and kept resident in memory rather than reloaded per request, consistent with the model-residency strategy already used for the language models.
+\end{itemize}
+
+All backend/server-side components of the voice pipeline (denoising, transcription, retrieval, generation, and synthesis) are implemented and run on the GPU workstation. The client device is only responsible for capturing microphone audio and playing back the synthesized response.
+
+\subsection{Edge Client and the Jetson Nano Microphone Limitation}
+
+A lightweight client script was written for the project's AION Technology Jetson Nano unit: it captures microphone audio, performs simple silence-based detection to identify when the visitor has finished speaking, streams the captured utterance to the backend over the network, and plays back the returned spoken response.
+
+During this work it became clear that \textbf{the Jetson Nano's microphone input is a hardware limitation} for reliable voice capture in this setup. To work around this rather than block on it, two things are in progress:
+
+\begin{itemize}
+    \item An \textbf{Android application is being developed in Android Studio} to serve as the audio input/output endpoint instead of the Jetson Nano's own microphone -- carrying microphone audio and speaker playback to and from the backend over the network (audio-over-IP), which avoids the on-device microphone constraint.
+    \item A \textbf{webcam is planned} to be paired with this audio path for the video/telepresence side of the system.
+    \item As an interim step to validate the backend voice pipeline itself before the Jetson Nano audio path (or the Android application) is ready, a \textbf{browser-based test client} was added to the existing laptop test page: a microphone button that opens the same voice endpoint the Jetson Nano client uses, captures audio from a laptop's own microphone, and plays the response through the laptop's speakers, connected to the backend over the existing Tailscale network. \textbf{The first end-to-end functional test of the voice pipeline was performed this way, from a laptop, rather than on the Jetson Nano hardware}, since the laptop's microphone does not have the same limitation.
+\end{itemize}
+
+\subsection{Automated Testing and Evaluation Infrastructure}
+
+The backend previously had no automated test suite. As part of this week's work, one was introduced using \texttt{pytest}:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}llc@{}}
+\toprule
+\textbf{Test file} & \textbf{Covers} & \textbf{Tests} \\
+\midrule
+\texttt{test\_session\_state.py} & Multi-turn session memory continuity/isolation & 5 \\
+\texttt{test\_voice\_stt.py} & Speech-to-text wrapper (audio conversion, model call) & 4 \\
+\texttt{test\_voice\_denoise.py} & Noise-suppression wrapper (sample-rate handling) & 4 \\
+\texttt{test\_voice\_tts.py} & Speech-synthesis wrapper & 3 \\
+\texttt{test\_ws\_voice.py} & Full voice endpoint message sequence, end to end & 3 \\
+\texttt{test\_rag\_accuracy.py} & Evaluation-scoring logic and dataset integrity & 3 \\
+\midrule
+\textbf{Total} & & \textbf{22} \\
+\bottomrule
+\end{tabular}
+\caption{Automated unit tests added this week. All 22 pass in the development environment. These tests verify the correctness of each component's logic and the pipeline's wiring using controlled inputs; they do not by themselves measure real-world speech recognition accuracy or audio quality, which requires the live models and real audio described in Section~4.}
+\end{table}
+
+In addition to the unit tests:
+
+\begin{itemize}
+    \item The RAG evaluation dataset was corrected and expanded. It previously contained only three sample questions, and those referenced knowledge-base source files that did not match the files actually present in the knowledge base. It now contains twenty questions grounded in the real knowledge-base content, and the evaluation script was extended with an explicit pass/fail accuracy threshold (80\%) rather than only reporting descriptive averages.
+    \item A script was added to measure Whisper's transcription word-error-rate with and without DeepFilterNet noise suppression applied, to quantify the benefit of noise suppression once real recorded audio samples are available.
+    \item A script was added to profile the voice pipeline's end-to-end latency stage by stage (denoising, transcription, retrieval and generation, synthesis) against the 4-second target.
+\end{itemize}
+
+\section{Testing Performed}
+
+\begin{itemize}
+    \item The 22 automated unit tests listed in Table~1 were executed and all passed.
+    \item The voice pipeline was functionally exercised end to end using the browser-based test client described in Section~2.4, connected over Tailscale to the GPU workstation, from a laptop's microphone and speakers, since the Jetson Nano's own microphone could not yet be used for this test.
+    \item Quantitative results (RAG accuracy on the twenty-question set, word-error-rate improvement from noise suppression, and measured end-to-end latency) have not been recorded in this report. The scripts to produce all three exist and are ready to run (Section~2.5), but generating trustworthy numbers requires executing them against the live models on the deployment workstation over a representative session, which is planned as the next step rather than reported here as an estimate.
+\end{itemize}
+
+\section{Challenges Faced}
+
+\begin{itemize}
+    \item \textbf{Jetson Nano microphone limitation.} The on-board microphone input on the project's Jetson Nano unit is not reliable enough for the voice pipeline's needs. This is being addressed by moving audio capture/playback to an Android application (in development) communicating with the backend over the network, rather than depending on the Jetson Nano's own audio hardware.
+    \item \textbf{GPU memory budget.} With the speech-to-text, noise-suppression, and speech-synthesis models added alongside the existing language, embedding, and vision models, keeping every model resident in GPU memory at once on a single workstation required trimming the model-routing configuration (Section~2.1) to avoid unnecessary duplicate models competing for the same memory.
+\end{itemize}
+
+\section{Work Remaining / Next Steps}
+
+\begin{itemize}
+    \item Complete the Android Studio application for microphone/speaker audio-over-IP, and integrate the planned webcam.
+    \item Run the RAG accuracy, word-error-rate, and end-to-end latency evaluations against the live deployment and record the actual measured results.
+    \item Repeat the end-to-end voice test directly on the Jetson Nano hardware once its audio input path (via the Android application) is finalized.
+\end{itemize}
+
+\section{Conclusion}
+
+The RAG/LLM pipeline optimization and multimodal knowledge-base ingestion assigned for this week are complete, and the full STT $\rightarrow$ RAG $\rightarrow$ LLM $\rightarrow$ TTS voice pipeline has been implemented and functionally validated end to end. The one item not yet complete is running this pipeline directly on the target Jetson Nano hardware, which is blocked on that unit's microphone limitation; a concrete mitigation (an Android-based audio client) is already in progress, and the pipeline itself was validated through an equivalent laptop-based test in the meantime so that this week's core deliverable -- a working conversational voice loop grounded in the project's RAG/LLM backend -- is demonstrably functional.
+
+\end{document}
