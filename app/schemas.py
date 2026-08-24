@@ -1,3 +1,5 @@
+import uuid
+from datetime import datetime
 from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
@@ -66,3 +68,41 @@ class RagResponse(BaseModel):
     used_rag: bool
     search_query: str
     timings: dict
+
+
+# ---- Persistent session/utterance storage (PostgreSQL + TimescaleDB) ----
+
+
+class CreateSessionRequest(BaseModel):
+    source: str = Field(default="voice", min_length=1, max_length=20)
+
+
+class SessionResponse(BaseModel):
+    id: uuid.UUID
+    created_at: datetime
+    closed_at: Optional[datetime] = None
+    source: str
+
+    model_config = {"from_attributes": True}
+
+
+class AppendUtteranceRequest(BaseModel):
+    speaker: Literal["human", "robot"]
+    text: str = Field(min_length=1)
+    extra: Optional[Dict[str, object]] = None
+
+
+class UtteranceResponse(BaseModel):
+    id: int
+    session_id: uuid.UUID
+    speaker: str
+    timestamp: datetime
+    text: str
+    extra: Optional[Dict[str, object]] = None
+
+    model_config = {"from_attributes": True}
+
+
+class SessionReplayResponse(BaseModel):
+    session: SessionResponse
+    utterances: List[UtteranceResponse]

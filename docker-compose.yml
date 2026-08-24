@@ -1,4 +1,22 @@
 services:
+  db:
+    image: timescale/timescaledb:latest-pg15
+    container_name: ollama-fastapi-robotproxy-db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-robot_sessions}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-robot_sessions}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   app:
     build: .
     container_name: ollama-fastapi-robotproxy
@@ -11,9 +29,16 @@ services:
       OLLAMA_REMOTE_URLS: ${OLLAMA_REMOTE_URLS:-http://host.docker.internal:11434}
       CHROMA_PERSIST_DIR: /data/chroma_store
       RAG_LOG_PATH: /data/logs/rag_events.jsonl
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-robot_sessions}
     volumes:
       - ./knowledge_base:/app/knowledge_base
       - ./artifacts:/app/artifacts
       - ./chroma_store:/data/chroma_store
       - ./logs:/data/logs
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  db_data:

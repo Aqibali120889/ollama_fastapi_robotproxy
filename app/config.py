@@ -82,6 +82,11 @@ class Settings(BaseSettings):
     voice_sample_rate: int = Field(default=16000, ge=8000)
     voice_max_audio_seconds: float = Field(default=20.0, ge=1.0)
 
+    # Persistent session/utterance storage (PostgreSQL + TimescaleDB). Postgres
+    # being unreachable must never break a live voice turn -- see app/db/safe_logging.py.
+    database_url: str = Field(default="postgresql+asyncpg://postgres:postgres@localhost:5432/robot_sessions")
+    database_connect_timeout_seconds: float = Field(default=2.0, ge=0.5)
+
     def remote_urls(self) -> List[str]:
         return [url.strip().rstrip("/") for url in self.ollama_remote_urls.split(",") if url.strip()]
 

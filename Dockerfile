@@ -13,6 +13,8 @@ COPY scripts ./scripts
 COPY evaluation ./evaluation
 COPY knowledge_base ./knowledge_base
 COPY .env.example ./.env.example
+COPY alembic.ini ./alembic.ini
+COPY alembic ./alembic
 
 EXPOSE 8000
 

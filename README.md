@@ -146,6 +146,22 @@ Adds a full spoken-conversation loop on top of the existing RAG/LLM backend: mic
 
 ---
 
+## Persistent Session/Utterance Storage (PostgreSQL + TimescaleDB)
+
+A durable, queryable conversation record — separate from and complementary to two things that already existed: the in-memory `SessionMemoryStore` (short-term LLM context, wiped on restart, no schema) and the JSONL `app/rag_logging.py` (RAG retrieval diagnostics, not a speaker-labeled transcript). This is the durable, replayable history.
+
+1. **Schema** (`app/db/models.py`) — `sessions` (id, created_at, closed_at, source) and `utterances` (id, timestamp, session_id, speaker `human`/`robot`, text, optional `extra` JSONB). `utterances` is a **TimescaleDB hypertable** partitioned on `timestamp`, which is why its primary key is the composite `(id, timestamp)` rather than just `id` — hypertables require the partitioning column to be part of any unique/primary key constraint. Model class is named `ConversationSession`, not `Session`, to avoid clashing with SQLAlchemy's own `Session`/`AsyncSession`.
+2. **API** (`app/session_api.py`, mounted under `/api/sessions`): `POST /api/sessions` (create), `POST /api/sessions/{id}/utterances` (append), `POST /api/sessions/{id}/close`, `GET /api/sessions/{id}` (replay — full session + all utterances as JSON, ordered by timestamp).
+3. **Wired into `/ws/voice` live** (`app/main.py`, `app/voice_pipeline.py`) — this is what actually logs STT transcripts and LLM responses, not just an API nobody calls. The websocket's existing `session_id` (already used for `SessionMemoryStore`) is reused as the DB session id, so no new identifier was introduced. A session row is created on connect, closed in a `finally` block covering every disconnect path, and each turn logs one `human` utterance (the transcript) and one `robot` utterance (the full assembled answer, with `used_rag`/`sources` in `extra`). `/chat` is **not** wired up in this pass — the task explicitly asked for STT/LLM logging, which is voice-specific; an easy, obvious follow-up if wanted later.
+4. **Never blocks or breaks a live voice turn** (`app/db/safe_logging.py`) — every DB write is fire-and-forget (`asyncio.create_task`, tracked in a module-level set so it can't be garbage-collected mid-flight) and wrapped so *any* exception is logged and swallowed, never raised. This was a deliberate fix, not just defensive boilerplate: awaiting these calls inline was measured to add up to the full `DATABASE_CONNECT_TIMEOUT_SECONDS` (default 2s) to every turn whenever Postgres is unreachable — directly eating into the same latency budget the streaming-TTS work targeted. `database_connect_timeout_seconds` itself exists so a genuine outage fails fast rather than hanging on the OS-level TCP timeout.
+5. **Migrations** (Alembic, `alembic/`) — one initial migration creates both tables, enables the `timescaledb` extension, and calls `create_hypertable('utterances', 'timestamp')`. Alembic runs synchronously (`psycopg2`, already a dependency) even though the app is fully async at runtime — migrations don't need to be async, and it's simpler this way. `alembic/env.py` reads `DATABASE_URL` from `app.config` directly rather than needing a separate migration-only config.
+6. **Docker Compose**: new `db` service (`timescale/timescaledb:latest-pg15`, named volume, healthcheck); `app` gets `depends_on: db: condition: service_healthy` and a `DATABASE_URL` pointing at the compose-network `db` hostname. Migrations are a **documented manual step** (`docker compose exec app alembic upgrade head`), not an auto-run entrypoint — simpler to reason about and debug than auto-migrating on every container start.
+7. **Testing**: fast, DB-free tests for Pydantic schema validation (`tests/test_session_schemas.py`) and `safe_logging`'s error-swallowing/fire-and-forget behavior with a fake session factory (`tests/test_db_safe_logging.py`); `tests/test_session_api.py` (marked `@pytest.mark.integration`) drives the full create → append → close → replay lifecycle plus 404/422 error paths via `httpx.AsyncClient` against the real FastAPI app, guarded by a live-reachability fixture that skips cleanly without a real Postgres (same pattern as the existing Ollama-dependent integration tests).
+
+**Verified in this sandbox**: all new models/schemas/routes import and compile cleanly; the initial migration's generated SQL was validated with `alembic upgrade head --sql` (offline mode, no live DB needed) and produces exactly the expected DDL including the hypertable conversion; `docker compose config` validates the full compose file. **Not verifiable here**: actual Postgres/TimescaleDB connectivity, the migration actually running, or the integration tests actually passing — Docker Desktop's engine isn't active in this sandbox (CLI present, daemon unreachable), so this needs the workstation, same as the rest of the voice-hardware-dependent work this session.
+
+---
+
 ## Architecture Overview
 
 ### Runtime flow
@@ -157,6 +173,7 @@ Adds a full spoken-conversation loop on top of the existing RAG/LLM backend: mic
   - `WS /ws/rag`
   - `WS /ws/voice` (audio in/out; denoise → Whisper → RAG/LLM → XTTS-v2)
   - `GET /health`
+  - `POST /api/sessions`, `POST /api/sessions/{id}/utterances`, `POST /api/sessions/{id}/close`, `GET /api/sessions/{id}` (persistent conversation storage, see below)
 - **Conversation Orchestration**: LangGraph (`app/conversation_graph.py`) decides RAG vs direct chat and persists session memory.
 - **Retriever**:
   - Dense vector retrieval from ChromaDB
@@ -217,6 +234,15 @@ pytest tests/ -m integration            # needs live Ollama + ingested KB + STT/
 
 For the Jetson Nano side, see `jetson_client/` — a separate, lightweight `requirements.txt` (no torch) since it only captures/plays audio and talks to `/ws/voice` over the network.
 
+### 6) (Optional) Persistent session storage (PostgreSQL + TimescaleDB)
+
+The rest of the app works fine without this — a missing/unreachable database only disables the `/api/sessions/*` endpoints and skips logging voice transcripts (see `app/db/safe_logging.py`); it never breaks RAG/chat/voice itself.
+
+```bash
+docker compose up -d db                 # or run your own PostgreSQL 15 + TimescaleDB and set DATABASE_URL in .env
+alembic upgrade head                    # creates sessions/utterances and converts utterances to a hypertable
+```
+
 #### Voice pipeline install notes (read before reporting a `df`/`torchaudio`/`TTS` import error)
 
 `requirements-voice.txt` pins `torch`/`torchaudio`/`numpy`/`transformers` to specific ranges and uses `coqui-tts` instead of the old `TTS` package — these aren't arbitrary, they're the result of working through a real, verified conflict chain on the actual deployment GPU (see the comments at the top of that file for why each pin exists). Loosening any of them will likely reintroduce one of these:
@@ -245,17 +271,20 @@ python3 -c "from TTS.api import TTS; print('coqui-tts OK')"
 
 ```bash
 cp .env.example .env
-docker compose up --build
+docker compose up --build -d
+docker compose exec app alembic upgrade head   # one-time (and after any future schema change)
 ```
 
-Default service:
+Services:
 - API: `http://localhost:8000`
+- `db`: PostgreSQL 15 + TimescaleDB, port `5432`, named volume `db_data` for persistence
 - Volumes:
   - `./chroma_store` -> Chroma persistence
   - `./logs` -> RAG logs
   - `./artifacts` -> benchmark/eval/profile outputs
 
 > Set `OLLAMA_LOCAL_BASE_URL` / `OLLAMA_REMOTE_URLS` in `.env` to host or remote Ollama endpoints.
+> Migrations are a deliberate manual step (`alembic upgrade head`), not run automatically on container start — simpler to reason about and debug than auto-migrating on every restart.
 
 ---
 
@@ -294,6 +323,23 @@ Not curl-able (binary WS frames in/out). Drive it with a sample WAV via the prof
 
 ```bash
 python scripts/profile_voice_latency.py --ws-url ws://localhost:8000/ws/voice --audio sample_utterance.wav
+```
+
+### Session storage (create → append → close → replay)
+
+```bash
+SESSION_ID=$(curl -s -X POST http://localhost:8000/api/sessions -H "Content-Type: application/json" \
+  -d '{"source":"voice"}' | jq -r .id)
+
+curl -s -X POST http://localhost:8000/api/sessions/$SESSION_ID/utterances -H "Content-Type: application/json" \
+  -d '{"speaker":"human","text":"What does the robot do?"}' | jq
+
+curl -s -X POST http://localhost:8000/api/sessions/$SESSION_ID/utterances -H "Content-Type: application/json" \
+  -d '{"speaker":"robot","text":"It presents company info and answers FAQs.","extra":{"used_rag":true}}' | jq
+
+curl -s -X POST http://localhost:8000/api/sessions/$SESSION_ID/close | jq
+
+curl -s http://localhost:8000/api/sessions/$SESSION_ID | jq   # full replay
 ```
 
 ---
@@ -367,6 +413,8 @@ Artifacts:
 - **Latency spikes**: profile with `scripts/profile_performance.py` (text) or `scripts/profile_voice_latency.py` (voice), then adjust model size, `REQUEST_TIMEOUT_SECONDS`, and context caps.
 - **Docker cannot reach Ollama**: use reachable host in `.env` (often `http://host.docker.internal:11434` on Docker Desktop).
 - **`/ws/voice` errors immediately**: confirm `requirements-voice.txt` is installed and the STT/TTS/denoise models have been downloaded (first call triggers the download if not cached) — check server logs for the specific stage that failed.
+- **`/api/sessions/*` returns 500 / a warning like "Failed to persist ... utterance"**: PostgreSQL isn't reachable or migrations haven't run — `docker compose up -d db` then `docker compose exec app alembic upgrade head` (or `alembic upgrade head` locally). This never breaks RAG/chat/voice itself, only session persistence.
+- **`relation "sessions" does not exist`**: migrations haven't been run yet — `alembic upgrade head`.
 
 ---
 
@@ -383,6 +431,9 @@ Artifacts:
 - `app/voice_tts.py`
 - `app/voice_pipeline.py`
 - `jetson_client/voice_client.py`
+- `app/db/models.py`, `app/db/database.py`, `app/db/crud.py`, `app/db/safe_logging.py`
+- `app/session_api.py`
+- `alembic.ini`, `alembic/env.py`, `alembic/versions/`
 - `tests/` (pytest suite)
 - `app/schemas.py`
 - `app/config.py`

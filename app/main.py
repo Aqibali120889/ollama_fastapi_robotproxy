@@ -8,9 +8,12 @@ from fastapi.responses import JSONResponse
 
 from app.config import get_settings
 from app.conversation_graph import build_conversation_graph
+from app.db.database import build_session_factory
+from app.db.safe_logging import close_session_safe, create_session_safe
 from app.ollama_proxy import OllamaProxyError, check_ollama_reachability, detect_cuda
 from app.rag_pipeline import rag_answer, rag_answer_stream
 from app.schemas import ChatRequest, ChatResponse, HealthResponse, RagRequest, RagResponse
+from app.session_api import router as session_router
 from app.voice_pipeline import run_voice_turn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -19,6 +22,15 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 app = FastAPI(title=settings.service_name)
 conversation_graph = build_conversation_graph(settings)
+
+# Persistent session/utterance storage (PostgreSQL + TimescaleDB). Stashed on
+# app.state so app/session_api.py's routes can reach it via the request; a
+# Postgres outage must never break RAG/chat/voice, so every other call site
+# goes through app.db.safe_logging's non-raising wrappers instead of this
+# factory directly.
+db_session_factory = build_session_factory(settings)
+app.state.db_session_factory = db_session_factory
+app.include_router(session_router)
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -190,6 +202,7 @@ async def ws_voice(websocket: WebSocket):
     await websocket.accept()
     session_id = str(uuid.uuid4())
     await _safe_send_text(websocket, {"type": "session", "session_id": session_id})
+    await create_session_safe(db_session_factory, session_id, source="voice")
 
     async def on_event(payload: dict) -> None:
         await _safe_send_text(websocket, payload)
@@ -206,12 +219,14 @@ async def ws_voice(websocket: WebSocket):
                 continue
 
             try:
-                await run_voice_turn(settings, session_id, audio_bytes, on_event, on_audio)
+                await run_voice_turn(settings, session_id, audio_bytes, on_event, on_audio, db_session_factory)
             except Exception as exc:
                 logger.exception("Voice pipeline stage failed")
                 await _safe_send_text(websocket, {"type": "error", "message": str(exc)})
     except WebSocketDisconnect:
         pass
+    finally:
+        await close_session_safe(db_session_factory, session_id)
 
 
 @app.exception_handler(HTTPException)
