@@ -269,8 +269,23 @@ async def _prepare_context(
     timings["retrieval_s"] = round(time.perf_counter() - t0, 3)
 
     routing_distances = retrieved["distances"]
-    best_distance = min(routing_distances) if routing_distances else float("inf")
-    used_rag = best_distance <= settings.rag_distance_threshold and bool(retrieved["documents"])
+    finite_dense_distances = [
+        distance for distance in routing_distances
+        if distance is not None and distance != float("inf")
+    ]
+    best_distance = min(finite_dense_distances) if finite_dense_distances else float("inf")
+
+    # Dense and keyword retrieval are independent evidence channels. A keyword-only
+    # result has no Chroma distance (infinity), so it must not be rejected solely
+    # because the dense channel did not return that document.
+    matched_by = retrieved.get("matched_by", [])
+    keyword_scores = retrieved.get("keyword_scores", [])
+    dense_evidence = best_distance <= settings.rag_distance_threshold
+    keyword_evidence = any(
+        "keyword" in channels and score >= 0.15
+        for channels, score in zip(matched_by, keyword_scores)
+    )
+    used_rag = bool(retrieved["documents"]) and (dense_evidence or keyword_evidence)
 
     filtered = _dedupe_and_cap_context(
         settings=settings,
