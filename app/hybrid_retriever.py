@@ -1,3 +1,4 @@
+import math
 from collections import Counter
 from typing import Dict, List, Optional
 
@@ -47,7 +48,7 @@ def _keyword_scores(query: str, docs: List[str]) -> Dict[int, float]:
             if term not in token_counts:
                 continue
             df = term_doc_freq.get(term, 0)
-            idf = __import__("math").log(1 + (total_docs - df + 0.5) / (df + 0.5))
+            idf = math.log(1 + (total_docs - df + 0.5) / (df + 0.5))
             tf = token_counts[term]
             denom = tf + k1 * (1 - b + b * (doc_len / max(avg_doc_len, 1)))
             score += idf * ((tf * (k1 + 1)) / max(denom, 1e-9))
